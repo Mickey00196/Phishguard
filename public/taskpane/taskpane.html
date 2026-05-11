@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>PhishGuard</title>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@600;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0a0d12;
+      --surface: #111520;
+      --surface2: #161b27;
+      --border: #1e2535;
+      --accent: #00e5ff;
+      --accent-dim: rgba(0,229,255,0.12);
+      --accent-glow: rgba(0,229,255,0.25);
+      --danger: #ff3b5c;
+      --danger-dim: rgba(255,59,92,0.12);
+      --warning: #ffaa00;
+      --warning-dim: rgba(255,170,0,0.12);
+      --safe: #00d68f;
+      --safe-dim: rgba(0,214,143,0.12);
+      --text: #e2e8f0;
+      --text-muted: #64748b;
+      --text-faint: #334155;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'DM Sans', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* Scanline texture overlay */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0,0,0,0.03) 2px,
+        rgba(0,0,0,0.03) 4px
+      );
+      pointer-events: none;
+      z-index: 100;
+    }
+
+    /* Header */
+    .header {
+      padding: 16px 16px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .header::after {
+      content: '';
+      position: absolute;
+      bottom: 0; left: 0; right: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--accent), transparent);
+      opacity: 0.4;
+    }
+
+    .logo-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .logo-icon {
+      width: 32px; height: 32px;
+      background: var(--accent-dim);
+      border: 1px solid var(--accent);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px;
+      box-shadow: 0 0 12px var(--accent-glow);
+      flex-shrink: 0;
+    }
+
+    .logo-text {
+      font-family: 'Syne', sans-serif;
+      font-size: 18px;
+      font-weight: 800;
+      letter-spacing: 0.5px;
+      color: var(--text);
+    }
+
+    .logo-text span {
+      color: var(--accent);
+    }
+
+    .version-badge {
+      margin-left: auto;
+      font-family: 'DM Mono', monospace;
+      font-size: 10px;
+      color: var(--text-muted);
+      background: var(--border);
+      padding: 2px 7px;
+      border-radius: 20px;
+    }
+
+    /* Main content */
+    .content {
+      padding: 14px 16px;
+    }
+
+    /* Idle state */
+    #state-idle {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .email-preview {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+      display: none;
+    }
+
+    .email-preview.visible { display: block; }
+
+    .preview-label {
+      font-family: 'DM Mono', monospace;
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+    }
+
+    .preview-field {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 5px;
+      font-size: 12px;
+      align-items: flex-start;
+    }
+
+    .preview-key {
+      color: var(--text-muted);
+      min-width: 52px;
+      font-weight: 500;
+      flex-shrink: 0;
+    }
+
+    .preview-val {
+      color: var(--text);
+      word-break: break-all;
+      line-height: 1.4;
+    }
+
+    /* Scan button */
+    .scan-btn {
+      width: 100%;
+      padding: 13px;
+      background: transparent;
+      border: 1px solid var(--accent);
+      border-radius: 10px;
+      color: var(--accent);
+      font-family: 'Syne', sans-serif;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      cursor: pointer;
+      position: relative;
+      overflow: hidden;
+      transition: all 0.2s ease;
+      text-transform: uppercase;
+    }
+
+    .scan-btn::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: var(--accent-dim);
+      opacity: 0;
+      transition: opacity 0.2s;
+    }
+
+    .scan-btn:hover::before { opacity: 1; }
+    .scan-btn:hover {
+      box-shadow: 0 0 20px var(--accent-glow);
+    }
+
+    .scan-btn:active { transform: scale(0.98); }
+    .scan-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    /* Loading state */
+    #state-loading {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 16px;
+      padding: 28px 0;
+    }
+
+    .radar {
+      width: 72px; height: 72px;
+      position: relative;
+    }
+
+    .radar-ring {
+      position: absolute;
+      border-radius: 50%;
+      border: 1px solid var(--accent);
+      animation: radar-pulse 2s ease-out infinite;
+    }
+
+    .radar-ring:nth-child(1) { inset: 0; animation-delay: 0s; }
+    .radar-ring:nth-child(2) { inset: 10px; animation-delay: 0.4s; }
+    .radar-ring:nth-child(3) { inset: 20px; animation-delay: 0.8s; }
+
+    .radar-center {
+      position: absolute;
+      inset: 30px;
+      background: var(--accent);
+      border-radius: 50%;
+      box-shadow: 0 0 12px var(--accent);
+      animation: radar-blink 1s ease-in-out infinite;
+    }
+
+    @keyframes radar-pulse {
+      0% { opacity: 0.8; transform: scale(0.8); }
+      100% { opacity: 0; transform: scale(1.3); }
+    }
+
+    @keyframes radar-blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+
+    .loading-text {
+      font-family: 'DM Mono', monospace;
+      font-size: 11px;
+      color: var(--accent);
+      text-align: center;
+      letter-spacing: 1px;
+    }
+
+    .loading-steps {
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .step-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: var(--text-faint);
+      transition: color 0.3s;
+    }
+
+    .step-item.active { color: var(--text-muted); }
+    .step-item.done { color: var(--safe); }
+
+    .step-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--text-faint);
+      flex-shrink: 0;
+      transition: background 0.3s;
+    }
+
+    .step-item.active .step-dot {
+      background: var(--accent);
+      box-shadow: 0 0 6px var(--accent);
+      animation: radar-blink 0.8s infinite;
+    }
+
+    .step-item.done .step-dot { background: var(--safe); }
+
+    /* Result state */
+    #state-result {
+      display: none;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    /* Score ring */
+    .score-section {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+      padding: 18px 0 10px;
+    }
+
+    .score-ring-wrap {
+      position: relative;
+      width: 100px; height: 100px;
+    }
+
+    .score-ring-svg {
+      width: 100%; height: 100%;
+      transform: rotate(-90deg);
+    }
+
+    .score-ring-bg {
+      fill: none;
+      stroke: var(--border);
+      stroke-width: 6;
+    }
+
+    .score-ring-fill {
+      fill: none;
+      stroke-width: 6;
+      stroke-linecap: round;
+      stroke-dasharray: 251;
+      stroke-dashoffset: 251;
+      transition: stroke-dashoffset 1.2s cubic-bezier(0.4, 0, 0.2, 1),
+                  stroke 0.3s ease;
+    }
+
+    .score-ring-center {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .score-number {
+      font-family: 'Syne', sans-serif;
+      font-size: 26px;
+      font-weight: 800;
+      line-height: 1;
+    }
+
+    .score-pct {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-family: 'DM Mono', monospace;
+    }
+
+    .verdict-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 14px;
+      border-radius: 20px;
+      font-family: 'Syne', sans-serif;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+
+    /* Breakdown bars */
+    .breakdown {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+    }
+
+    .breakdown-title {
+      font-family: 'DM Mono', monospace;
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+      color: var(--text-muted);
+      margin-bottom: 10px;
+    }
+
+    .breakdown-item {
+      margin-bottom: 9px;
+    }
+
+    .breakdown-item:last-child { margin-bottom: 0; }
+
+    .breakdown-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 11px;
+      margin-bottom: 4px;
+    }
+
+    .breakdown-name { color: var(--text-muted); }
+    .breakdown-val { font-family: 'DM Mono', monospace; color: var(--text); }
+
+    .bar-track {
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+
+    .bar-fill {
+      height: 100%;
+      border-radius: 2px;
+      transition: width 1s cubic-bezier(0.4, 0, 0.2, 1);
+      width: 0%;
+    }
+
+    /* Signals list */
+    .signals {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+    }
+
+    .signals-title {
+      font-family: 'DM Mono', monospace;
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+      color: var(--text-muted);
+      margin-bottom: 10px;
+    }
+
+    .signal-item {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+      margin-bottom: 7px;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .signal-item:last-child { margin-bottom: 0; }
+
+    .signal-dot {
+      width: 5px; height: 5px;
+      border-radius: 50%;
+      margin-top: 5px;
+      flex-shrink: 0;
+    }
+
+    .no-signals {
+      font-size: 12px;
+      color: var(--text-muted);
+      text-align: center;
+      padding: 8px 0;
+    }
+
+    /* Rescan button */
+    .rescan-btn {
+      width: 100%;
+      padding: 10px;
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text-muted);
+      font-family: 'DM Sans', sans-serif;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .rescan-btn:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    /* Error state */
+    #state-error {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      padding: 24px 0;
+      text-align: center;
+    }
+
+    .error-icon { font-size: 32px; }
+
+    .error-msg {
+      font-size: 13px;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+
+    /* Utility colors */
+    .c-danger { color: var(--danger); }
+    .c-warning { color: var(--warning); }
+    .c-safe { color: var(--safe); }
+    .c-accent { color: var(--accent); }
+
+    .bg-danger { background: var(--danger-dim); border-color: var(--danger) !important; }
+    .bg-warning { background: var(--warning-dim); border-color: var(--warning) !important; }
+    .bg-safe { background: var(--safe-dim); border-color: var(--safe) !important; }
+
+    /* Footer */
+    .footer {
+      padding: 10px 16px;
+      border-top: 1px solid var(--border);
+      font-family: 'DM Mono', monospace;
+      font-size: 9px;
+      color: var(--text-faint);
+      text-align: center;
+      letter-spacing: 0.5px;
+    }
+  </style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="header">
+  <div class="logo-row">
+    <div class="logo-icon">🛡️</div>
+    <div class="logo-text">Phish<span>Guard</span></div>
+    <div class="version-badge">v2.0</div>
+  </div>
+</div>
+
+<div class="content">
+
+  <!-- STATE: IDLE -->
+  <div id="state-idle">
+    <div class="email-preview" id="email-preview">
+      <div class="preview-label">Geselecteerde e-mail</div>
+      <div class="preview-field">
+        <span class="preview-key">Van</span>
+        <span class="preview-val" id="prev-sender">–</span>
+      </div>
+      <div class="preview-field">
+        <span class="preview-key">Onderwerp</span>
+        <span class="preview-val" id="prev-subject">–</span>
+      </div>
+      <div class="preview-field">
+        <span class="preview-key">Datum</span>
+        <span class="preview-val" id="prev-date">–</span>
+      </div>
+    </div>
+    <button class="scan-btn" id="scan-btn" onclick="startScan()">
+      ⚡ Scan op phishing
+    </button>
+  </div>
+
+  <!-- STATE: LOADING -->
+  <div id="state-loading">
+    <div class="radar">
+      <div class="radar-ring"></div>
+      <div class="radar-ring"></div>
+      <div class="radar-ring"></div>
+      <div class="radar-center"></div>
+    </div>
+    <div class="loading-text">Analyseren...</div>
+    <div class="loading-steps">
+      <div class="step-item" id="step-1">
+        <div class="step-dot"></div>
+        <span>E-mail data ophalen</span>
+      </div>
+      <div class="step-item" id="step-2">
+        <div class="step-dot"></div>
+        <span>Claude AI analyse</span>
+      </div>
+      <div class="step-item" id="step-3">
+        <div class="step-dot"></div>
+        <span>Links controleren (VirusTotal)</span>
+      </div>
+      <div class="step-item" id="step-4">
+        <div class="step-dot"></div>
+        <span>Domein verificatie</span>
+      </div>
+      <div class="step-item" id="step-5">
+        <div class="step-dot"></div>
+        <span>Resultaat berekenen</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- STATE: RESULT -->
+  <div id="state-result">
+
+    <div class="score-section">
+      <div class="score-ring-wrap">
+        <svg class="score-ring-svg" viewBox="0 0 88 88">
+          <circle class="score-ring-bg" cx="44" cy="44" r="40"/>
+          <circle class="score-ring-fill" id="score-ring" cx="44" cy="44" r="40"/>
+        </svg>
+        <div class="score-ring-center">
+          <div class="score-number" id="score-number">0</div>
+          <div class="score-pct">risico</div>
+        </div>
+      </div>
+      <div class="verdict-badge" id="verdict-badge">–</div>
+    </div>
+
+    <!-- Breakdown bars -->
+    <div class="breakdown">
+      <div class="breakdown-title">Analyse breakdown</div>
+
+      <div class="breakdown-item">
+        <div class="breakdown-row">
+          <span class="breakdown-name">Claude AI</span>
+          <span class="breakdown-val" id="b-claude">–</span>
+        </div>
+        <div class="bar-track"><div class="bar-fill" id="bar-claude" style="background: var(--accent)"></div></div>
+      </div>
+
+      <div class="breakdown-item">
+        <div class="breakdown-row">
+          <span class="breakdown-name">Safe Browsing</span>
+          <span class="breakdown-val" id="b-safebrowsing">–</span>
+        </div>
+        <div class="bar-track"><div class="bar-fill" id="bar-safebrowsing" style="background: var(--warning)"></div></div>
+      </div>
+
+      <div class="breakdown-item">
+        <div class="breakdown-row">
+          <span class="breakdown-name">VirusTotal</span>
+          <span class="breakdown-val" id="b-virustotal">–</span>
+        </div>
+        <div class="bar-track"><div class="bar-fill" id="bar-virustotal" style="background: var(--danger)"></div></div>
+      </div>
+
+      <div class="breakdown-item">
+        <div class="breakdown-row">
+          <span class="breakdown-name">Domein check</span>
+          <span class="breakdown-val" id="b-domain">–</span>
+        </div>
+        <div class="bar-track"><div class="bar-fill" id="bar-domain" style="background: var(--safe)"></div></div>
+      </div>
+    </div>
+
+    <!-- Signals -->
+    <div class="signals">
+      <div class="signals-title">Gevonden signalen</div>
+      <div id="signals-list"></div>
+    </div>
+
+    <button class="rescan-btn" onclick="resetToIdle()">↩ Opnieuw scannen</button>
+  </div>
+
+  <!-- STATE: ERROR -->
+  <div id="state-error">
+    <div class="error-icon">⚠️</div>
+    <div class="error-msg" id="error-msg">Er is iets misgegaan. Controleer je verbinding met de backend.</div>
+    <button class="rescan-btn" onclick="resetToIdle()">↩ Probeer opnieuw</button>
+  </div>
+
+</div>
+
+<div class="footer">Powered by Claude AI · Safe Browsing · VirusTotal</div>
+
+<script>
+  // ─────────────────────────────────────────────
+  // CONFIG — verander dit naar jouw Railway URL
+  // ─────────────────────────────────────────────
+  const BACKEND_URL = 'https://phishguards.up.railway.app';
+
+  // ─────────────────────────────────────────────
+  // Office.js initialisatie
+  // ─────────────────────────────────────────────
+  Office.onReady((info) => {
+    if (info.host === Office.HostType.Outlook) {
+      loadEmailPreview();
+    }
+  });
+
+  function loadEmailPreview() {
+    const item = Office.context.mailbox.item;
+    if (!item) return;
+
+    const preview = document.getElementById('email-preview');
+    preview.classList.add('visible');
+
+    // Afzender
+    const sender = item.from;
+    if (sender) {
+      document.getElementById('prev-sender').textContent =
+        `${sender.displayName} <${sender.emailAddress}>`;
+    }
+
+    // Onderwerp
+    document.getElementById('prev-subject').textContent =
+      item.subject || '(geen onderwerp)';
+
+    // Datum
+    if (item.dateTimeCreated) {
+      document.getElementById('prev-date').textContent =
+        new Date(item.dateTimeCreated).toLocaleString('nl-NL');
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // State management
+  // ─────────────────────────────────────────────
+  function showState(name) {
+    ['idle','loading','result','error'].forEach(s => {
+      const el = document.getElementById(`state-${s}`);
+      el.style.display = (s === name) ? 'flex' : 'none';
+    });
+  }
+
+  function resetToIdle() {
+    showState('idle');
+    // Reset steps
+    for (let i = 1; i <= 5; i++) {
+      const step = document.getElementById(`step-${i}`);
+      step.className = 'step-item';
+    }
+  }
+
+  function setStep(n) {
+    for (let i = 1; i <= 5; i++) {
+      const step = document.getElementById(`step-${i}`);
+      if (i < n) step.className = 'step-item done';
+      else if (i === n) step.className = 'step-item active';
+      else step.className = 'step-item';
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // Scan logic
+  // ─────────────────────────────────────────────
+  async function startScan() {
+    showState('loading');
+    setStep(1);
+
+    try {
+      const item = Office.context.mailbox.item;
+
+      // Stap 1: e-mail data ophalen
+      const emailData = await getEmailData(item);
+      setStep(2);
+
+      // Stap 2–4: backend aanroepen
+      await new Promise(r => setTimeout(r, 400));
+      setStep(3);
+      await new Promise(r => setTimeout(r, 600));
+      setStep(4);
+      await new Promise(r => setTimeout(r, 400));
+      setStep(5);
+
+      // Backend call
+      const response = await fetch(`${BACKEND_URL}/scan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(emailData)
+      });
+
+      if (!response.ok) throw new Error(`Backend fout: ${response.status}`);
+      const result = await response.json();
+
+      await new Promise(r => setTimeout(r, 300));
+      showResult(result);
+
+    } catch (err) {
+      console.error('[PhishGuard]', err);
+      document.getElementById('error-msg').textContent =
+        `Fout: ${err.message}. Controleer of je Railway backend online is.`;
+      showState('error');
+    }
+  }
+
+  async function getEmailData(item) {
+    return new Promise((resolve, reject) => {
+      item.body.getAsync(Office.CoercionType.Text, (result) => {
+        if (result.status === Office.AsyncResultStatus.Failed) {
+          reject(new Error('Kon e-mail body niet lezen'));
+          return;
+        }
+
+        const sender = item.from;
+        const body = result.value || '';
+
+        // Links uit body halen
+        const linkRegex = /https?:\/\/[^\s"'<>)]+/gi;
+        const links = [...new Set(body.match(linkRegex) || [])].slice(0, 10);
+
+        resolve({
+          sender: sender ? sender.emailAddress : '',
+          senderName: sender ? sender.displayName : '',
+          subject: item.subject || '',
+          body: body.slice(0, 3000),
+          links: links,
+          receivedAt: item.dateTimeCreated
+            ? new Date(item.dateTimeCreated).toISOString()
+            : new Date().toISOString()
+        });
+      });
+    });
+  }
+
+  // ─────────────────────────────────────────────
+  // Resultaat weergeven
+  // ─────────────────────────────────────────────
+  function showResult(result) {
+    showState('result');
+
+    const score = Math.round(result.score || 0);
+    const breakdown = result.breakdown || {};
+    const signals = result.signals || [];
+
+    // Kleur bepalen op basis van score
+    let color, label, emoji, bgClass;
+    if (score >= 70) {
+      color = 'var(--danger)'; label = 'Gevaarlijk'; emoji = '🚨'; bgClass = 'bg-danger';
+    } else if (score >= 40) {
+      color = 'var(--warning)'; label = 'Verdacht'; emoji = '⚠️'; bgClass = 'bg-warning';
+    } else {
+      color = 'var(--safe)'; label = 'Veilig'; emoji = '✅'; bgClass = 'bg-safe';
+    }
+
+    // Score ring animeren
+    const ring = document.getElementById('score-ring');
+    const circumference = 251;
+    const offset = circumference - (score / 100) * circumference;
+    ring.style.stroke = color;
+    ring.style.strokeDashoffset = offset;
+
+    // Score getal animeren
+    const numEl = document.getElementById('score-number');
+    numEl.style.color = color;
+    let current = 0;
+    const interval = setInterval(() => {
+      current = Math.min(current + 2, score);
+      numEl.textContent = current + '%';
+      if (current >= score) clearInterval(interval);
+    }, 20);
+
+    // Verdict badge
+    const badge = document.getElementById('verdict-badge');
+    badge.textContent = `${emoji} ${label}`;
+    badge.className = `verdict-badge ${bgClass}`;
+    badge.style.color = color;
+
+    // Breakdown bars
+    const fields = {
+      'claude': breakdown.claude || breakdown.ai || 0,
+      'safebrowsing': breakdown.safeBrowsing || breakdown.safe_browsing || 0,
+      'virustotal': breakdown.virusTotal || breakdown.virus_total || 0,
+      'domain': breakdown.domain || 0,
+    };
+
+    Object.entries(fields).forEach(([key, val]) => {
+      const pct = Math.round(val);
+      document.getElementById(`b-${key}`).textContent = `${pct}%`;
+      setTimeout(() => {
+        document.getElementById(`bar-${key}`).style.width = `${pct}%`;
+      }, 100);
+    });
+
+    // Signalen
+    const signalsList = document.getElementById('signals-list');
+    if (signals.length === 0) {
+      signalsList.innerHTML = '<div class="no-signals">✓ Geen verdachte signalen gevonden</div>';
+    } else {
+      signalsList.innerHTML = signals.map(sig => {
+        let dotColor = 'var(--warning)';
+        if (sig.severity === 'high') dotColor = 'var(--danger)';
+        if (sig.severity === 'low') dotColor = 'var(--accent)';
+        return `
+          <div class="signal-item">
+            <div class="signal-dot" style="background: ${dotColor}"></div>
+            <span>${sig.message || sig}</span>
+          </div>
+        `;
+      }).join('');
+    }
+  }
+
+  // Start direct als Office klaar is
+  showState('idle');
+</script>
+</body>
+</html>
