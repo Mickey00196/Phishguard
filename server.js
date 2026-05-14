@@ -85,21 +85,36 @@ function runDeterministicChecks({ sender, subject, body, links }) {
     "belastingdienst": ["belastingdienst.nl"], "klm": ["klm.com"],
   };
 
+  // Legitieme email/betaal diensten die namens anderen sturen
+  const trustedSenders = [
+    "stripe.com", "sendgrid.net", "mailchimp.com", "mailgun.org",
+    "amazonses.com", "sparkpostmail.com", "mandrillapp.com",
+    "exacttarget.com", "salesforce.com", "hubspot.com",
+    "klaviyo.com", "brevo.com", "sendinblue.com", "postmarkapp.com",
+    "news.bitvavo.com", "em.bitvavo.com"
+  ];
+
   const senderDomain = senderLower.split("@")[1] || "";
+  const isTrustedSender = trustedSenders.some(d => senderDomain === d || senderDomain.endsWith(`.${d}`));
 
-  for (const brand of brands) {
-    const inSubject = subjectLower.includes(brand);
-    const inBody    = bodyLower.includes(brand);
-    const inSender  = senderLower.includes(brand);
-    const legitDomains = brandDomains[brand] || [`${brand}.com`, `${brand}.nl`];
-    const isLegitDomain = legitDomains.some(d => senderDomain === d || senderDomain.endsWith(`.${d}`));
+  if (!isTrustedSender) {
+    for (const brand of brands) {
+      const inSubject = subjectLower.includes(brand);
+      const inBody    = bodyLower.slice(0, 500).includes(brand); // Alleen eerste 500 chars
+      const inSender  = senderLower.includes(brand);
+      const legitDomains = brandDomains[brand] || [`${brand}.com`, `${brand}.nl`];
+      const isLegitDomain = legitDomains.some(d => senderDomain === d || senderDomain.endsWith(`.${d}`));
 
-    if ((inSubject || inBody || inSender) && !isLegitDomain && senderDomain) {
-      signals.push({
-        message:  `Afzender (${senderDomain}) doet zich voor als ${brand.toUpperCase()} — klassieke spoofing`,
-        severity: "high"
-      });
-      break;
+      // Alleen flaggen als brand IN het afzenderdomein zit maar niet het echte domein is
+      const brandInDomain = senderDomain.includes(brand) && !isLegitDomain;
+
+      if (brandInDomain && senderDomain) {
+        signals.push({
+          message:  `Afzender (${senderDomain}) doet zich voor als ${brand.toUpperCase()} — klassieke spoofing`,
+          severity: "high"
+        });
+        break;
+      }
     }
   }
 
@@ -232,21 +247,25 @@ function calculateScore(findings, aiResult) {
   const mediumCount = findings.filter(f => f.severity === "medium").length;
   const aiScore     = Math.min(aiResult.aiScore || 0, 100);
 
-  // Deterministische score — zwaarder gewogen bij meerdere high signals
+  // Deterministische score op basis van gevonden signalen
   let deterministicScore = 0;
-  deterministicScore += highCount   * 30;
+  deterministicScore += highCount   * 35;
   deterministicScore += mediumCount * 15;
   deterministicScore = Math.min(deterministicScore, 100);
 
-  // Als AI en deterministisch beide hoog zijn → boost naar boven
-  let total;
-  if (highCount >= 2 && aiScore >= 70) {
-    total = Math.min(Math.round((deterministicScore * 0.35) + (aiScore * 0.65) + 10), 100);
-  } else if (highCount >= 1 && aiScore >= 60) {
-    total = Math.min(Math.round((deterministicScore * 0.35) + (aiScore * 0.65) + 5), 100);
-  } else {
-    total = Math.round((deterministicScore * 0.35) + (aiScore * 0.65));
-  }
+  // Minimumscores op basis van rode signalen — AI mag dit NIET omlaag trekken
+  let minimum = 0;
+  if (highCount >= 3) minimum = 80;
+  else if (highCount >= 2) minimum = 70;
+  else if (highCount >= 1) minimum = 50;
+  else if (mediumCount >= 2) minimum = 35;
+
+  // Gewogen gemiddelde — deterministisch weegt zwaarder
+  let total = Math.round((deterministicScore * 0.5) + (aiScore * 0.5));
+
+  // Minimum altijd gegarandeerd — rode signalen winnen van AI
+  total = Math.max(total, minimum);
+  total = Math.min(total, 100);
 
   return {
     total,
