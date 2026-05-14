@@ -4,9 +4,6 @@ const cors    = require("cors");
 const app  = express();
 const PORT = process.env.PORT || 8080;
 
-// ─────────────────────────────────────────────────────────────────────
-// CORS — staat verzoeken toe van Outlook, Gmail én de browser extensie
-// ─────────────────────────────────────────────────────────────────────
 app.use(cors({
   origin: [
     "https://outlook.office.com",
@@ -21,22 +18,18 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: "1mb" }));
-app.use(express.static("public")); // serveert taskpane.html + taskpane.js
+app.use(express.static("public"));
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
-// ── Health check ──────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({
     status:  "ok",
-    service: "PhishGuard backend",
-    cors:    "Outlook + Gmail + Extension",
-    key:     ANTHROPIC_API_KEY ? "✓ set" : "✗ MISSING — set ANTHROPIC_API_KEY",
+    service: "PhishGuard backend v2.4",
+    key:     ANTHROPIC_API_KEY ? "✓ set" : "✗ MISSING",
   });
 });
 
-// ── Hoofd scan endpoint ───────────────────────────────────────────────
-// Wordt aangeroepen door: browser extensie, Outlook add-in én Gmail add-on
 app.post("/scan", async (req, res) => {
   try {
     const { sender, senderName, subject, body, links, receivedAt } = req.body;
@@ -45,16 +38,16 @@ app.post("/scan", async (req, res) => {
       return res.status(400).json({ error: "Geen e-mail data ontvangen" });
     }
 
-    // Deterministische checks (snel, geen AI nodig)
+    // Deterministische checks
     const findings = runDeterministicChecks({ sender, subject, body, links });
 
-    // AI analyse via Claude
+    // AI analyse
     const aiResult = await analyzeWithClaude(
       { sender, senderName, subject, body, links, receivedAt },
       findings
     );
 
-    // Eindscore berekenen
+    // Score berekenen
     const score = calculateScore(findings, aiResult);
 
     res.json({
@@ -67,63 +60,97 @@ app.post("/scan", async (req, res) => {
 
   } catch (err) {
     console.error("Scan fout:", err.message);
-    res.status(500).json({
-      error:   err.message,
-      score:   0,
-      signals: [],
-      verdict: "onbekend",
-    });
+    res.status(500).json({ error: err.message, score: 0, signals: [], verdict: "onbekend" });
   }
 });
 
 // ── Deterministische checks ───────────────────────────────────────────
 function runDeterministicChecks({ sender, subject, body, links }) {
   const signals = [];
-
-  // 1. Spoed-woorden in onderwerp
-  const urgencyWords = ["urgent", "dringend", "onmiddellijk", "account geblokkeerd",
-    "verify now", "act now", "suspended", "winner", "congratulations",
-    "klik hier", "bevestig nu", "wachtwoord verlopen"];
   const subjectLower = (subject || "").toLowerCase();
-  if (urgencyWords.some(w => subjectLower.includes(w))) {
-    signals.push({ message: "Spoed- of alarmeringstaal in onderwerp", severity: "high" });
+  const bodyLower    = (body    || "").toLowerCase();
+  const senderLower  = (sender  || "").toLowerCase();
+
+  // 1. Bekende merken gespooft via vreemd domein
+  const brands = ["dhl", "fedex", "ups", "postnl", "paypal", "ing", "rabobank",
+    "abn", "microsoft", "apple", "google", "amazon", "netflix", "bol.com",
+    "belastingdienst", "klm", "ns", "ziggo", "tmobile", "vodafone"];
+
+  const brandDomains = {
+    "dhl": ["dhl.com", "dhl.nl"], "paypal": ["paypal.com", "paypal.nl"],
+    "microsoft": ["microsoft.com", "outlook.com", "live.com"],
+    "apple": ["apple.com"], "google": ["google.com", "gmail.com"],
+    "amazon": ["amazon.com", "amazon.nl"], "ing": ["ing.nl"],
+    "rabobank": ["rabobank.nl"], "postnl": ["postnl.nl"],
+    "belastingdienst": ["belastingdienst.nl"], "klm": ["klm.com"],
+  };
+
+  const senderDomain = senderLower.split("@")[1] || "";
+
+  for (const brand of brands) {
+    const inSubject = subjectLower.includes(brand);
+    const inBody    = bodyLower.includes(brand);
+    const inSender  = senderLower.includes(brand);
+    const legitDomains = brandDomains[brand] || [`${brand}.com`, `${brand}.nl`];
+    const isLegitDomain = legitDomains.some(d => senderDomain === d || senderDomain.endsWith(`.${d}`));
+
+    if ((inSubject || inBody || inSender) && !isLegitDomain && senderDomain) {
+      signals.push({
+        message:  `Afzender (${senderDomain}) doet zich voor als ${brand.toUpperCase()} — klassieke spoofing`,
+        severity: "high"
+      });
+      break;
+    }
   }
 
-  // 2. Verdachte links
-  const suspiciousTlds = [".xyz", ".top", ".click", ".tk", ".ml", ".ga", ".cf"];
+  // 2. Spoed/alarm taal
+  const urgencyWords = ["dringend", "urgent", "onmiddellijk", "verify now", "act now",
+    "account geblokkeerd", "suspended", "bevestig nu", "wachtwoord verlopen",
+    "klik hier", "laatste waarschuwing", "actie vereist", "uw account",
+    "bevestigen", "afwachting", "leveringsgegevens", "pakket"];
+  const urgencyHits = urgencyWords.filter(w => bodyLower.includes(w) || subjectLower.includes(w));
+  if (urgencyHits.length >= 2) {
+    signals.push({ message: `Meerdere urgentie-signalen: "${urgencyHits.slice(0,3).join('", "')}"`, severity: "high" });
+  } else if (urgencyHits.length === 1) {
+    signals.push({ message: `Urgentietaal gevonden: "${urgencyHits[0]}"`, severity: "medium" });
+  }
+
+  // 3. Verdachte links
+  const suspiciousTlds = [".xyz", ".top", ".click", ".tk", ".ml", ".ga", ".cf", ".pw", ".cc"];
+  const cloudRedirects = ["googleapis.com/storage", "storage.googleapis.com",
+    "bit.ly", "tinyurl", "t.co", "goo.gl", "rebrand.ly"];
+
   (links || []).forEach(link => {
     try {
       const url = new URL(link);
       if (suspiciousTlds.some(tld => url.hostname.endsWith(tld))) {
-        signals.push({ message: `Verdacht domein gedetecteerd: ${url.hostname}`, severity: "high" });
+        signals.push({ message: `Verdacht TLD domein: ${url.hostname}`, severity: "high" });
       }
-      if (url.hostname.includes("paypal") && !url.hostname.endsWith("paypal.com")) {
-        signals.push({ message: "Nep PayPal link gedetecteerd", severity: "high" });
+      if (cloudRedirects.some(r => link.includes(r))) {
+        signals.push({ message: `Link via cloud/redirect dienst: ${url.hostname}`, severity: "high" });
       }
-      if (url.hostname.includes("microsoft") && !url.hostname.endsWith("microsoft.com")) {
-        signals.push({ message: "Nep Microsoft link gedetecteerd", severity: "high" });
+      // Brand spoofing in URL
+      for (const brand of brands) {
+        const legitDomains = brandDomains[brand] || [`${brand}.com`, `${brand}.nl`];
+        if (url.hostname.includes(brand) && !legitDomains.some(d => url.hostname === d || url.hostname.endsWith(`.${d}`))) {
+          signals.push({ message: `Nep ${brand.toUpperCase()} link: ${url.hostname}`, severity: "high" });
+        }
       }
     } catch {}
   });
 
-  // 3. Veel links in de body
-  if ((links || []).length > 5) {
-    signals.push({ message: `${links.length} links gevonden in e-mail`, severity: "medium" });
+  // 4. Generieke aanhef
+  const genericGreetings = ["beste klant", "dear customer", "geachte klant",
+    "beste gebruiker", "dear user", "hello user"];
+  if (genericGreetings.some(g => bodyLower.includes(g))) {
+    signals.push({ message: "Generieke aanhef zonder persoonlijke naam", severity: "medium" });
   }
 
-  // 4. Afzender domein check
-  const senderDomain = (sender || "").split("@")[1] || "";
-  const freeDomains  = ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com"];
-  if (freeDomains.includes(senderDomain) && subject && subject.toLowerCase().includes("invoice")) {
-    signals.push({ message: "Factuur van gratis e-maildomein", severity: "medium" });
-  }
-
-  // 5. Wachtwoord/credential verzoeken
-  const credWords = ["password", "wachtwoord", "inloggen", "login", "verify your account",
-    "bevestig je account", "creditcard", "credit card", "bank"];
-  const bodyLower = (body || "").toLowerCase();
+  // 5. Credential verzoeken
+  const credWords = ["wachtwoord", "password", "inloggen", "creditcard",
+    "credit card", "bankrekening", "pincode", "cvv", "iban"];
   if (credWords.some(w => bodyLower.includes(w))) {
-    signals.push({ message: "Verzoek om inloggegevens of financiële info", severity: "high" });
+    signals.push({ message: "Verzoek om gevoelige informatie", severity: "high" });
   }
 
   return signals;
@@ -132,39 +159,42 @@ function runDeterministicChecks({ sender, subject, body, links }) {
 // ── Claude AI analyse ─────────────────────────────────────────────────
 async function analyzeWithClaude(email, deterministicFindings) {
   if (!ANTHROPIC_API_KEY) {
-    console.warn("Geen ANTHROPIC_API_KEY — AI analyse overgeslagen");
-    return { signals: [], verdict: getVerdict(0), summary: "AI niet beschikbaar" };
+    return { signals: [], aiScore: 0, verdict: "onbekend", summary: "AI niet beschikbaar" };
   }
 
   const findingsSummary = deterministicFindings.length > 0
-    ? deterministicFindings.map(f => `- ${f.message} (${f.severity})`).join("\n")
+    ? deterministicFindings.map(f => `- [${f.severity}] ${f.message}`).join("\n")
     : "Geen deterministische signalen gevonden";
 
-  const prompt = `
-Je bent een cybersecurity expert gespecialiseerd in phishing detectie.
-Analyseer deze e-mail en geef een JSON response.
+  const prompt = `Je bent een expert phishing-analist. Analyseer deze e-mail KRITISCH en geef een eerlijke risicoscore.
 
-E-MAIL DATA:
+E-MAIL:
 Afzender: ${email.sender}
-Naam: ${email.senderName || "onbekend"}
 Onderwerp: ${email.subject}
-Body (eerste 1500 tekens): ${(email.body || "").slice(0, 1500)}
+Body: ${(email.body || "").slice(0, 1500)}
 Links: ${(email.links || []).join(", ") || "geen"}
-Ontvangen: ${email.receivedAt || "onbekend"}
 
 REEDS GEVONDEN SIGNALEN:
 ${findingsSummary}
 
-Geef je analyse als JSON in dit formaat (ALLEEN JSON, geen tekst eromheen):
+SCORING RICHTLIJNEN:
+- 0-20%:  Duidelijk legitiem (bekende afzender, geen verdachte elementen)
+- 21-40%: Waarschijnlijk veilig maar kleine twijfels
+- 41-60%: Twijfelachtig, meerdere gele vlaggen
+- 61-80%: Waarschijnlijk phishing, duidelijke rode vlaggen
+- 81-100%: Bijna zeker phishing (brand spoofing + verdachte links + urgentie = minimaal 85%)
+
+BELANGRIJK: Als een e-mail een bekend merk nagebootst (DHL, PayPal, bank etc.) maar van een vreemd domein komt, is de score MINIMAAL 80%.
+
+Geef ALLEEN JSON terug:
 {
-  "aiScore": <getal 0-100, phishing risico>,
+  "aiScore": <0-100>,
   "verdict": "<veilig|verdacht|gevaarlijk>",
-  "summary": "<1-2 zinnen samenvatting in het Nederlands>",
+  "summary": "<2-3 zinnen uitleg in het Nederlands>",
   "signals": [
-    { "message": "<signaal beschrijving>", "severity": "<low|medium|high>" }
+    { "message": "<signaal>", "severity": "<low|medium|high>" }
   ]
-}
-`;
+}`;
 
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method:  "POST",
@@ -175,7 +205,7 @@ Geef je analyse als JSON in dit formaat (ALLEEN JSON, geen tekst eromheen):
     },
     body: JSON.stringify({
       model:      "claude-haiku-4-5-20251001",
-      max_tokens: 800,
+      max_tokens: 600,
       messages:   [{ role: "user", content: prompt }],
     }),
   });
@@ -192,34 +222,39 @@ Geef je analyse als JSON in dit formaat (ALLEEN JSON, geen tekst eromheen):
   try {
     return JSON.parse(clean);
   } catch {
-    console.error("AI gaf geen geldige JSON:", text.slice(0, 200));
     return { signals: [], aiScore: 0, verdict: "onbekend", summary: "" };
   }
 }
 
 // ── Score berekening ──────────────────────────────────────────────────
 function calculateScore(findings, aiResult) {
-  const severityScore = { high: 25, medium: 15, low: 5 };
+  const highCount   = findings.filter(f => f.severity === "high").length;
+  const mediumCount = findings.filter(f => f.severity === "medium").length;
+  const aiScore     = Math.min(aiResult.aiScore || 0, 100);
 
-  // Deterministische score
-  const deterministicScore = Math.min(
-    findings.reduce((sum, f) => sum + (severityScore[f.severity] || 10), 0),
-    100
-  );
+  // Deterministische score — zwaarder gewogen bij meerdere high signals
+  let deterministicScore = 0;
+  deterministicScore += highCount   * 30;
+  deterministicScore += mediumCount * 15;
+  deterministicScore = Math.min(deterministicScore, 100);
 
-  // AI score
-  const aiScore = Math.min(aiResult.aiScore || 0, 100);
-
-  // Gewogen gemiddelde
-  const total = Math.round((deterministicScore * 0.4) + (aiScore * 0.6));
+  // Als AI en deterministisch beide hoog zijn → boost naar boven
+  let total;
+  if (highCount >= 2 && aiScore >= 70) {
+    total = Math.min(Math.round((deterministicScore * 0.35) + (aiScore * 0.65) + 10), 100);
+  } else if (highCount >= 1 && aiScore >= 60) {
+    total = Math.min(Math.round((deterministicScore * 0.35) + (aiScore * 0.65) + 5), 100);
+  } else {
+    total = Math.round((deterministicScore * 0.35) + (aiScore * 0.65));
+  }
 
   return {
     total,
     breakdown: {
-      claude:      aiScore,
-      safeBrowsing: Math.min(findings.filter(f => f.severity === "high").length * 30, 100),
-      virusTotal:  Math.min(findings.filter(f => f.message.includes("domein")).length * 40, 100),
-      domain:      deterministicScore,
+      claude:       aiScore,
+      safeBrowsing: Math.min(highCount * 35, 100),
+      virusTotal:   Math.min(findings.filter(f => f.message.includes("domein") || f.message.includes("link")).length * 40, 100),
+      domain:       deterministicScore,
     },
   };
 }
@@ -230,10 +265,9 @@ function getVerdict(score) {
   return "veilig";
 }
 
-// ── Start server ──────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🛡️  PhishGuard backend draait op poort ${PORT}`);
   console.log(`   CORS:    Outlook + Gmail + Browser extensie`);
   console.log(`   Health:  http://localhost:${PORT}/health`);
-  console.log(`   API key: ${ANTHROPIC_API_KEY ? "✓ gevonden" : "✗ ONTBREEKT — stel ANTHROPIC_API_KEY in"}\n`);
+  console.log(`   API key: ${ANTHROPIC_API_KEY ? "✓ gevonden" : "✗ ONTBREEKT"}\n`);
 });
