@@ -39,18 +39,30 @@ async function checkDomainAge(domain) {
     return cached.result;
   }
 
+  // Probeer meerdere RDAP servers
+  const rdapServers = [
+    `https://rdap.org/domain/${rootDomain}`,
+    `https://rdap.arin.net/registry/domain/${rootDomain}`,
+    `https://rdap.verisign.com/com/v1/domain/${rootDomain}`,
+  ];
+
   try {
-    const controller = new AbortController();
-    const timeout    = setTimeout(() => controller.abort(), 3000); // 3s timeout
+    let response = null;
 
-    const response = await fetch(`https://rdap.org/domain/${rootDomain}`, {
-      signal: controller.signal,
-      headers: { "Accept": "application/json" }
-    });
+    for (const server of rdapServers) {
+      try {
+        const controller = new AbortController();
+        const timeout    = setTimeout(() => controller.abort(), 4000);
+        response = await fetch(server, {
+          signal: controller.signal,
+          headers: { "Accept": "application/json" }
+        });
+        clearTimeout(timeout);
+        if (response.ok) break;
+      } catch (e) { continue; }
+    }
 
-    clearTimeout(timeout);
-
-    if (!response.ok) {
+    if (!response || !response.ok) {
       domainCache.set(rootDomain, { result: null, timestamp: Date.now() });
       return null;
     }
