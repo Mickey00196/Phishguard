@@ -633,7 +633,9 @@ function calculateScore(findings, aiResult, domainAge, body = "", links = []) {
     hasBrandSpoof && ageInDays !== null && ageInDays < s.ageDays.veryNew
       ? s.floors.brandSpoofNewDomain : 0,
     hasBrandSpoof ? s.floors.brandSpoof : 0,
-    h >= 3 ? s.floors.threeHigh
+    h >= 5 ? 97
+      : h >= 4 ? 93
+      : h >= 3 ? s.floors.threeHigh
       : h >= 2 ? s.floors.twoHigh
       : h >= 1 && m >= 1 ? s.floors.highAndMedium
       : h >= 1 ? s.floors.oneHigh
