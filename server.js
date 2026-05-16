@@ -44,7 +44,7 @@ const CONFIG = {
     ing:             ["ing.nl"],
     rabobank:        ["rabobank.nl"],
     abnamro:         ["abnamro.nl"],
-    postnl:          ["postnl.nl"],
+    postnl:          ["postnl.nl", "edm.postnl.nl", "post.nl"],
     belastingdienst: ["belastingdienst.nl"],
     klm:             ["klm.com"],
     ns:              ["ns.nl"],
@@ -241,7 +241,7 @@ function checkBrandSpoofing(senderEmail) {
 
   for (const [brand, officialDomains] of Object.entries(CONFIG.brandDomains)) {
     const isOfficial = officialDomains.some(
-      d => rootDomain === d || domain.endsWith("." + d)
+      d => rootDomain === d || domain === d || domain.endsWith("." + d)
     );
     if (isOfficial) continue; // legitimate sender
 
