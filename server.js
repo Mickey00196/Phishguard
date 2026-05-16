@@ -154,7 +154,8 @@ function deduplicateSignals(signals) {
 // DOMAIN AGE ANALYZER (RDAP)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const domainCache = new Map();
+const domainCache    = new Map();
+const CACHE_VERSION  = "v2"; // bump this to bust cache on deploy
 
 async function fetchRdapData(rootDomain) {
   for (const buildUrl of CONFIG.rdapServers) {
@@ -169,13 +170,24 @@ async function fetchRdapData(rootDomain) {
 }
 
 function parseRegistrationDate(rdapData) {
-  const event = (rdapData?.events || []).find(
-    e => e.eventAction === "registration" || e.eventAction === "created"
-  );
+  const events = rdapData?.events || [];
+
+  // STRICT: only accept explicit registration or created events
+  // Never use "last changed" — it gives wrong dates for major domains
+  const VALID_ACTIONS = new Set(["registration", "created"]);
+  const event = events.find(e => VALID_ACTIONS.has(e.eventAction));
+
   if (!event?.eventDate) return null;
+
   const date = new Date(event.eventDate);
   const now  = new Date();
-  if (isNaN(date) || date > now || date.getFullYear() < 1990) return null;
+
+  // Sanity checks: must be a real past date
+  if (isNaN(date))                    return null;
+  if (date > now)                     return null; // future date
+  if (date.getFullYear() < 1985)      return null; // before DNS existed
+  if (date.getFullYear() > now.getFullYear()) return null;
+
   return date;
 }
 
@@ -191,16 +203,20 @@ async function getDomainAge(senderEmail) {
       [...CONFIG.trustedEmailProviders].some(p => fullDomain.endsWith("." + p))) return null;
 
   const cached = domainCache.get(rootDomain);
-  if (cached && Date.now() - cached.timestamp < CONFIG.domainCacheTtlMs) return cached.result;
+  if (cached && cached.version === CACHE_VERSION && Date.now() - cached.timestamp < CONFIG.domainCacheTtlMs) {
+    return cached.result;
+  }
 
   const data    = await fetchRdapData(rootDomain);
   const regDate = data ? parseRegistrationDate(data) : null;
-  const result  = regDate
-    ? { ageInDays: Math.floor((Date.now() - regDate) / 86_400_000), registeredAt: regDate.toISOString(), domain: rootDomain }
+
+  // Explicit result: found age OR null (not found) — never a guess
+  const result = regDate
+    ? { ageInDays: Math.floor((Date.now() - regDate) / 86_400_000), registeredAt: regDate.toISOString(), domain: rootDomain, found: true }
     : null;
 
-  domainCache.set(rootDomain, { result, timestamp: Date.now() });
-  if (result) console.log(`[RDAP] ${rootDomain}: ${result.ageInDays}d old`);
+  domainCache.set(rootDomain, { result, version: CACHE_VERSION, timestamp: Date.now() });
+  console.log(`[RDAP] ${rootDomain}: ${result ? result.ageInDays + "d old" : "not found"}`);
   return result;
 }
 
@@ -443,12 +459,14 @@ async function analyzeWithClaude(email, findings) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function getDomainAgeSignal(domainAge) {
-  if (!domainAge) return null;
+  // Explicitly null = RDAP lookup failed or domain not found — say so clearly
+  if (domainAge === null) return null; // no signal — don't guess
+
   const { ageInDays } = domainAge;
   const { ageDays }   = CONFIG.scoring;
-  if (ageInDays < ageDays.veryNew) return { message: `Domein slechts ${ageInDays} dagen oud — zeer verdacht`, severity: "high" };
-  if (ageInDays < ageDays.young)   return { message: `Domein ${ageInDays} dagen oud (< 6 maanden)`, severity: "medium" };
-  if (ageInDays > ageDays.old)     return { message: `Domein ${Math.floor(ageInDays / 365)} jaar oud — legitimiteitssignaal`, severity: "low" };
+  if (ageInDays < ageDays.veryNew) return { message: `Domein slechts ${ageInDays} dagen oud — extreem verdacht`, severity: "high" };
+  if (ageInDays < ageDays.young)   return { message: `Domein ${ageInDays} dagen oud (minder dan 6 maanden)`, severity: "medium" };
+  if (ageInDays > ageDays.old)     return { message: `Domein ${Math.floor(ageInDays / 365)} jaar oud`, severity: "low" };
   return null;
 }
 
