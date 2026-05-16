@@ -1,11 +1,29 @@
+"use strict";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PhishGuard Backend — v3.1.0
+// Architect · Engineer · Reviewer · Optimizer
+// ─────────────────────────────────────────────────────────────────────────────
+
 const express = require("express");
 const cors    = require("cors");
 
-const app  = express();
-const PORT = process.env.PORT || 8080;
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFIG — single source of truth for all tuneable values
+// ─────────────────────────────────────────────────────────────────────────────
 
-app.use(cors({
-  origin: [
+const CONFIG = {
+  port:             process.env.PORT || 8080,
+  anthropicApiKey:  process.env.ANTHROPIC_API_KEY,
+  anthropicModel:   "claude-haiku-4-5-20251001",
+  anthropicVersion: "2023-06-01",
+  maxTokens:        600,
+  bodyMaxChars:     1500,   // consistent across all analyzers
+  maxLinks:         10,
+  rdapTimeoutMs:    4000,
+  domainCacheTtlMs: 24 * 60 * 60 * 1000,
+
+  allowedOrigins: [
     "https://outlook.office.com",
     "https://outlook.live.com",
     "https://outlook.office365.com",
@@ -13,375 +31,417 @@ app.use(cors({
     "https://script.google.com",
     "https://phishguards.up.railway.app",
   ],
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-}));
 
-app.use(express.json({ limit: "1mb" }));
-app.use(express.static("public"));
+  // brand → all official domains (including subdomains)
+  // REVIEWER FIX: also catches typosquats via containsBrand() check below
+  brandDomains: {
+    dhl:             ["dhl.com",   "dhl.nl"],
+    paypal:          ["paypal.com","paypal.nl"],
+    microsoft:       ["microsoft.com","outlook.com","live.com","hotmail.com"],
+    apple:           ["apple.com"],
+    google:          ["google.com","gmail.com","google.nl"],
+    amazon:          ["amazon.com","amazon.nl","amazon.de"],
+    ing:             ["ing.nl"],
+    rabobank:        ["rabobank.nl"],
+    abnamro:         ["abnamro.nl"],
+    postnl:          ["postnl.nl"],
+    belastingdienst: ["belastingdienst.nl"],
+    klm:             ["klm.com"],
+    ns:              ["ns.nl"],
+  },
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+  // ENGINEER FIX: skip RDAP for these — also skip spoofing check
+  trustedEmailProviders: new Set([
+    "sendgrid.net","mailchimp.com","klaviyo.com","brevo.com",
+    "hubspot.com","mailgun.org","amazonses.com","sparkpostmail.com",
+    "mandrillapp.com","exacttarget.com","salesforce.com","postmarkapp.com",
+    "stripe.com","constantcontact.com","campaignmonitor.com",
+  ]),
 
-// ── Domein cache — voorkomt dubbele RDAP calls ────────────────────────
-const domainCache = new Map();
-const CACHE_TTL   = 24 * 60 * 60 * 1000; // 24 uur
+  suspiciousTlds:   new Set([".xyz",".top",".click",".tk",".ml",".ga",".cf",".pw",".cc"]),
+  urlShorteners:    new Set(["bit.ly","tinyurl.com","t.co","goo.gl","rebrand.ly","cutt.ly","tiny.cc","is.gd"]),
+  cloudStorageUrls: ["storage.googleapis.com","storage.cloud.google.com","blob.core.windows.net"],
 
-async function checkDomainAge(domain) {
-  if (!domain) return null;
+  urgencyPhrases: [
+    "dringend","urgent","onmiddellijk","account geblokkeerd","suspended",
+    "bevestig nu","wachtwoord verlopen","laatste waarschuwing","actie vereist",
+    "verify now","act now","your account has been","confirm your account",
+  ],
+  credentialPhrases: [
+    "wachtwoord invoeren","enter your password","verify your identity",
+    "bevestig je identiteit","creditcard nummer","bankrekening","pincode","cvv",
+  ],
+  genericGreetings: [
+    "beste klant","dear customer","geachte klant",
+    "beste gebruiker","dear user","hello user","dear valued",
+  ],
 
-  // Haal rootdomein op (bijv. mail.evil.xyz → evil.xyz)
-  const parts      = domain.split(".");
-  const rootDomain = parts.length > 2 ? parts.slice(-2).join(".") : domain;
+  multiPartTlds: ["co.uk","co.nz","co.za","com.au","org.uk","net.uk","com.br"],
+  // OPTIMIZER: Set for O(1) lookup
+  genericTlds: new Set(["com","nl","net","org","io","co","de","fr","be","eu"]),
 
-  // Check cache eerst
-  const cached = domainCache.get(rootDomain);
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-    return cached.result;
-  }
+  rdapServers: [
+    d => `https://rdap.org/domain/${d}`,
+    d => `https://rdap.arin.net/registry/domain/${d}`,
+    d => `https://rdap.verisign.com/com/v1/domain/${d}`,
+  ],
 
-  // Probeer meerdere RDAP servers
-  const rdapServers = [
-    `https://rdap.org/domain/${rootDomain}`,
-    `https://rdap.arin.net/registry/domain/${rootDomain}`,
-    `https://rdap.verisign.com/com/v1/domain/${rootDomain}`,
-  ];
+  // Scoring weights
+  scoring: {
+    deterministicWeight: 0.4,
+    aiWeight:            0.4,
+    ageBoostWeight:      0.5,
+    highSignalPoints:    35,
+    mediumSignalPoints:  15,
+    floors: { threeHigh: 85, twoHigh: 75, oneHigh: 55, twoMedium: 40 },
+    ageBoosts: { veryNew: 40, young: 20, old: -15 },
+    ageDays:   { veryNew: 30, young: 180, old: 730 },
+    legitimateCap: 20,
+  },
+};
 
+// ─────────────────────────────────────────────────────────────────────────────
+// UTILS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** "user@mail.evil.com" → "mail.evil.com" */
+const getDomainFromEmail = email =>
+  (email || "").toLowerCase().split("@")[1] || "";
+
+/** "mail.evil.xyz" → "evil.xyz" | "foo.co.uk" → "foo.co.uk" */
+function getRootDomain(domain) {
+  const parts = domain.split(".");
+  if (parts.length <= 1) return domain;
+  if (CONFIG.multiPartTlds.some(tld => domain.endsWith(tld))) return parts.slice(-3).join(".");
+  return parts.slice(-2).join(".");
+}
+
+/** Fetch with hard timeout — returns null on failure */
+async function fetchWithTimeout(url, ms, options = {}) {
+  const ctrl  = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
   try {
-    let response = null;
-
-    for (const server of rdapServers) {
-      try {
-        const controller = new AbortController();
-        const timeout    = setTimeout(() => controller.abort(), 4000);
-        response = await fetch(server, {
-          signal: controller.signal,
-          headers: { "Accept": "application/json" }
-        });
-        clearTimeout(timeout);
-        if (response.ok) break;
-      } catch (e) { continue; }
-    }
-
-    if (!response || !response.ok) {
-      domainCache.set(rootDomain, { result: null, timestamp: Date.now() });
-      return null;
-    }
-
-    const data   = await response.json();
-    const events = data.events || [];
-
-    // Zoek registratiedatum
-    const regEvent = events.find(e =>
-      e.eventAction === "registration" || e.eventAction === "created"
-    );
-
-    if (!regEvent || !regEvent.eventDate) {
-      domainCache.set(rootDomain, { result: null, timestamp: Date.now() });
-      return null;
-    }
-
-    const regDate  = new Date(regEvent.eventDate);
-    const ageInDays = Math.floor((Date.now() - regDate.getTime()) / (1000 * 60 * 60 * 24));
-
-    const result = { ageInDays, registeredAt: regEvent.eventDate, domain: rootDomain };
-    domainCache.set(rootDomain, { result, timestamp: Date.now() });
-
-    console.log(`[RDAP] ${rootDomain}: ${ageInDays} dagen oud`);
-    return result;
-
-  } catch (e) {
-    if (e.name !== "AbortError") console.error(`[RDAP] Fout voor ${rootDomain}:`, e.message);
-    domainCache.set(rootDomain, { result: null, timestamp: Date.now() });
+    const res = await fetch(url, { ...options, signal: ctrl.signal });
+    clearTimeout(timer);
+    return res;
+  } catch {
+    clearTimeout(timer);
     return null;
   }
 }
 
-app.get("/health", (req, res) => {
-  res.json({
-    status:  "ok",
-    service: "PhishGuard backend v2.4",
-    key:     ANTHROPIC_API_KEY ? "✓ set" : "✗ MISSING",
-  });
-});
-
-app.post("/scan", async (req, res) => {
-  try {
-    const { sender, senderName, subject, body, links, receivedAt } = req.body;
-
-    if (!sender && !subject && !body) {
-      return res.status(400).json({ error: "Geen e-mail data ontvangen" });
-    }
-
-    // Deterministische checks
-    const findings = runDeterministicChecks({ sender, subject, body, links });
-
-    // Haal afzenderdomein op
-    const senderDomain = (sender || "").split("@")[1] || "";
-
-    // Claude AI + RDAP domeincheck parallel uitvoeren (sneller!)
-    const [aiResult, domainAge] = await Promise.all([
-      analyzeWithClaude({ sender, senderName, subject, body, links, receivedAt }, findings),
-      checkDomainAge(senderDomain)
-    ]);
-
-    // Voeg domeinleeftijd toe aan signalen
-    if (domainAge !== null) {
-      if (domainAge.ageInDays < 30) {
-        findings.push({
-          message:  `Domein is slechts ${domainAge.ageInDays} dagen oud — extreem verdacht`,
-          severity: "high"
-        });
-      } else if (domainAge.ageInDays < 180) {
-        findings.push({
-          message:  `Domein is ${domainAge.ageInDays} dagen oud (minder dan 6 maanden)`,
-          severity: "medium"
-        });
-      } else if (domainAge.ageInDays > 730) {
-        findings.push({
-          message:  `Domein bestaat al ${Math.floor(domainAge.ageInDays / 365)} jaar — legitimiteitssignaal`,
-          severity: "low"
-        });
-      }
-    }
-
-    // Score berekenen
-    const score = calculateScore(findings, aiResult, domainAge);
-
-    res.json({
-      score:     score.total,
-      breakdown: score.breakdown,
-      signals:   [...findings, ...(aiResult.signals || [])],
-      verdict:   aiResult.verdict || getVerdict(score.total),
-      summary:   aiResult.summary || "",
-      domainAge: domainAge ? {
-        days: domainAge.ageInDays,
-        registeredAt: domainAge.registeredAt
-      } : null
-    });
-
-  } catch (err) {
-    console.error("Scan fout:", err.message);
-    res.status(500).json({ error: err.message, score: 0, signals: [], verdict: "onbekend" });
-  }
-});
-
-// ── Deterministische checks ───────────────────────────────────────────
-function runDeterministicChecks({ sender, subject, body, links }) {
-  const signals = [];
-  const subjectLower = (subject || "").toLowerCase();
-  const bodyLower    = (body    || "").toLowerCase();
-  const senderLower  = (sender  || "").toLowerCase();
-
-  // 1. Bekende merken gespooft via vreemd domein
-  const brands = ["dhl", "fedex", "ups", "postnl", "paypal", "ing", "rabobank",
-    "abn", "microsoft", "apple", "google", "amazon", "netflix", "bol.com",
-    "belastingdienst", "klm", "ns", "ziggo", "tmobile", "vodafone"];
-
-  const brandDomains = {
-    "dhl": ["dhl.com", "dhl.nl"], "paypal": ["paypal.com", "paypal.nl"],
-    "microsoft": ["microsoft.com", "outlook.com", "live.com"],
-    "apple": ["apple.com"], "google": ["google.com", "gmail.com"],
-    "amazon": ["amazon.com", "amazon.nl"], "ing": ["ing.nl"],
-    "rabobank": ["rabobank.nl"], "postnl": ["postnl.nl"],
-    "belastingdienst": ["belastingdienst.nl"], "klm": ["klm.com"],
-  };
-
-  const senderDomain = senderLower.split("@")[1] || "";
-
-  // Alleen flaggen als brand IN het afzenderdomein zit maar niet het echte domein is
-  for (const brand of brands) {
-    const legitDomains = brandDomains[brand] || [`${brand}.com`, `${brand}.nl`];
-    const isLegitDomain = legitDomains.some(d => senderDomain === d || senderDomain.endsWith(`.${d}`));
-    const brandInDomain = senderDomain.includes(brand) && !isLegitDomain;
-
-    if (brandInDomain && senderDomain) {
-      signals.push({
-        message:  `Afzender (${senderDomain}) doet zich voor als ${brand.toUpperCase()} — klassieke spoofing`,
-        severity: "high"
-      });
-      break;
-    }
-  }
-
-  // 2. Spoed/alarm taal
-  const urgencyWords = ["dringend", "urgent", "onmiddellijk", "verify now", "act now",
-    "account geblokkeerd", "suspended", "bevestig nu", "wachtwoord verlopen",
-    "klik hier", "laatste waarschuwing", "actie vereist", "uw account",
-    "bevestigen", "afwachting", "leveringsgegevens", "pakket"];
-  const urgencyHits = urgencyWords.filter(w => bodyLower.includes(w) || subjectLower.includes(w));
-  if (urgencyHits.length >= 2) {
-    signals.push({ message: `Meerdere urgentie-signalen: "${urgencyHits.slice(0,3).join('", "')}"`, severity: "high" });
-  } else if (urgencyHits.length === 1) {
-    signals.push({ message: `Urgentietaal gevonden: "${urgencyHits[0]}"`, severity: "medium" });
-  }
-
-  // 3. Verdachte links
-  const suspiciousTlds = [".xyz", ".top", ".click", ".tk", ".ml", ".ga", ".cf", ".pw", ".cc"];
-  const cloudRedirects = ["googleapis.com/storage", "storage.googleapis.com",
-    "bit.ly", "tinyurl", "t.co", "goo.gl", "rebrand.ly"];
-
-  (links || []).forEach(link => {
-    try {
-      const url = new URL(link);
-      if (suspiciousTlds.some(tld => url.hostname.endsWith(tld))) {
-        signals.push({ message: `Verdacht TLD domein: ${url.hostname}`, severity: "high" });
-      }
-      if (cloudRedirects.some(r => link.includes(r))) {
-        signals.push({ message: `Link via cloud/redirect dienst: ${url.hostname}`, severity: "high" });
-      }
-      // Brand spoofing in URL
-      for (const brand of brands) {
-        const legitDomains = brandDomains[brand] || [`${brand}.com`, `${brand}.nl`];
-        if (url.hostname.includes(brand) && !legitDomains.some(d => url.hostname === d || url.hostname.endsWith(`.${d}`))) {
-          signals.push({ message: `Nep ${brand.toUpperCase()} link: ${url.hostname}`, severity: "high" });
-        }
-      }
-    } catch {}
-  });
-
-  // 4. Generieke aanhef
-  const genericGreetings = ["beste klant", "dear customer", "geachte klant",
-    "beste gebruiker", "dear user", "hello user"];
-  if (genericGreetings.some(g => bodyLower.includes(g))) {
-    signals.push({ message: "Generieke aanhef zonder persoonlijke naam", severity: "medium" });
-  }
-
-  // 5. Credential verzoeken
-  const credWords = ["wachtwoord", "password", "inloggen", "creditcard",
-    "credit card", "bankrekening", "pincode", "cvv", "iban"];
-  if (credWords.some(w => bodyLower.includes(w))) {
-    signals.push({ message: "Verzoek om gevoelige informatie", severity: "high" });
-  }
-
-  return signals;
+/** JSON.parse that never throws */
+function safeParseJson(text) {
+  try { return JSON.parse(text.replace(/```json|```/g, "").trim()); }
+  catch { return null; }
 }
 
-// ── Claude AI analyse ─────────────────────────────────────────────────
-async function analyzeWithClaude(email, deterministicFindings) {
-  if (!ANTHROPIC_API_KEY) {
-    return { signals: [], aiScore: 0, verdict: "onbekend", summary: "AI niet beschikbaar" };
-  }
+/**
+ * ENGINEER FIX: Deduplicate signals by message text.
+ * Prevents AI and deterministic layer from reporting the same issue twice.
+ */
+function deduplicateSignals(signals) {
+  const seen = new Set();
+  return signals.filter(s => {
+    const key = s.message.toLowerCase().slice(0, 60);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
-  const findingsSummary = deterministicFindings.length > 0
-    ? deterministicFindings.map(f => `- [${f.severity}] ${f.message}`).join("\n")
+// ─────────────────────────────────────────────────────────────────────────────
+// DOMAIN AGE ANALYZER (RDAP)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const domainCache = new Map();
+
+async function fetchRdapData(rootDomain) {
+  for (const buildUrl of CONFIG.rdapServers) {
+    const res = await fetchWithTimeout(
+      buildUrl(rootDomain),
+      CONFIG.rdapTimeoutMs,
+      { headers: { Accept: "application/json" } }
+    );
+    if (res?.ok) return res.json().catch(() => null);
+  }
+  return null;
+}
+
+function parseRegistrationDate(rdapData) {
+  const event = (rdapData?.events || []).find(
+    e => e.eventAction === "registration" || e.eventAction === "created"
+  );
+  if (!event?.eventDate) return null;
+  const date = new Date(event.eventDate);
+  const now  = new Date();
+  if (isNaN(date) || date > now || date.getFullYear() < 1990) return null;
+  return date;
+}
+
+async function getDomainAge(senderEmail) {
+  const fullDomain = getDomainFromEmail(senderEmail);
+  if (!fullDomain) return null;
+
+  const rootDomain = getRootDomain(fullDomain);
+  if (CONFIG.genericTlds.has(rootDomain)) return null;
+
+  // ENGINEER FIX: skip RDAP for trusted providers — no value, wastes time
+  if (CONFIG.trustedEmailProviders.has(rootDomain) ||
+      [...CONFIG.trustedEmailProviders].some(p => fullDomain.endsWith("." + p))) return null;
+
+  const cached = domainCache.get(rootDomain);
+  if (cached && Date.now() - cached.timestamp < CONFIG.domainCacheTtlMs) return cached.result;
+
+  const data    = await fetchRdapData(rootDomain);
+  const regDate = data ? parseRegistrationDate(data) : null;
+  const result  = regDate
+    ? { ageInDays: Math.floor((Date.now() - regDate) / 86_400_000), registeredAt: regDate.toISOString(), domain: rootDomain }
+    : null;
+
+  domainCache.set(rootDomain, { result, timestamp: Date.now() });
+  if (result) console.log(`[RDAP] ${rootDomain}: ${result.ageInDays}d old`);
+  return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DETERMINISTIC ANALYZER
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * REVIEWER FIX: Catches both exact-prefix spoofing AND typosquats.
+ * - "dhl.evil.com"      → root = "evil.com"      → no match (correct)
+ * - "dhl-tracking.com"  → root = "dhl-tracking.com" → containsBrand → HIGH
+ * - "mailing.dhl.nl"    → root = "dhl.nl"         → isOfficial → SAFE
+ * - "dhl.com"           → root = "dhl.com"         → isOfficial → SAFE
+ */
+function checkBrandSpoofing(senderEmail) {
+  const domain     = getDomainFromEmail(senderEmail);
+  const rootDomain = getRootDomain(domain);
+
+  const isTrusted = CONFIG.trustedEmailProviders.has(rootDomain) ||
+    [...CONFIG.trustedEmailProviders].some(p => domain.endsWith("." + p));
+  if (isTrusted) return null;
+
+  for (const [brand, officialDomains] of Object.entries(CONFIG.brandDomains)) {
+    const isOfficial = officialDomains.some(
+      d => rootDomain === d || domain.endsWith("." + d)
+    );
+    if (isOfficial) continue; // legitimate sender
+
+    // Typosquat: root domain contains brand name but isn't official
+    // e.g. "dhl-tracking.com", "paypal-secure.net", "ing-alert.xyz"
+    const isTyposquat = rootDomain.includes(brand) && !isOfficial;
+
+    // Subdomain spoof: full domain contains brand as subdomain of unknown root
+    // e.g. "dhl.scammer.ru" — root is "scammer.ru", but "dhl" appears before it
+    const isSubdomainSpoof = domain.split(".").slice(0, -2).includes(brand);
+
+    if (isTyposquat || isSubdomainSpoof) {
+      return {
+        message:  `Afzender (${domain}) imiteert ${brand.toUpperCase()} — waarschijnlijk nep domein`,
+        severity: "high",
+      };
+    }
+  }
+  return null;
+}
+
+function checkUrgency(subject, body) {
+  const text = `${subject} ${(body || "").slice(0, CONFIG.bodyMaxChars)}`.toLowerCase();
+  const hits  = CONFIG.urgencyPhrases.filter(p => text.includes(p));
+  if (hits.length >= 2) return { message: "Meerdere urgentie-signalen gevonden", severity: "high" };
+  if (hits.length === 1) return { message: `Urgentietaal: "${hits[0]}"`, severity: "medium" };
+  return null;
+}
+
+function checkLinks(links = []) {
+  return links.slice(0, CONFIG.maxLinks).flatMap(link => {
+    try {
+      const url  = new URL(link);
+      const host = url.hostname.toLowerCase();
+      const out  = [];
+      if ([...CONFIG.suspiciousTlds].some(tld => host.endsWith(tld)))
+        out.push({ message: `Verdacht TLD: ${host}`, severity: "high" });
+      if (CONFIG.urlShorteners.has(host))
+        out.push({ message: `URL shortener: ${host}`, severity: "medium" });
+      if (CONFIG.cloudStorageUrls.some(c => link.includes(c)))
+        out.push({ message: `Cloud storage link in e-mail: ${host}`, severity: "high" });
+      return out;
+    } catch { return []; }
+  });
+}
+
+function checkCredentials(body) {
+  const lower = (body || "").toLowerCase().slice(0, CONFIG.bodyMaxChars);
+  return CONFIG.credentialPhrases.some(p => lower.includes(p))
+    ? { message: "Verzoek om gevoelige gegevens", severity: "high" }
+    : null;
+}
+
+function checkGenericGreeting(body) {
+  const preview = (body || "").toLowerCase().slice(0, 300);
+  return CONFIG.genericGreetings.some(g => preview.includes(g))
+    ? { message: "Generieke aanhef zonder persoonlijke naam", severity: "medium" }
+    : null;
+}
+
+function runDeterministicChecks({ sender, subject, body, links }) {
+  return [
+    checkBrandSpoofing(sender),
+    checkUrgency(subject, body),
+    ...checkLinks(links),
+    checkCredentials(body),
+    checkGenericGreeting(body),
+  ].filter(Boolean);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI ANALYZER
+// ─────────────────────────────────────────────────────────────────────────────
+
+function buildPrompt(email, findings) {
+  const senderDomain  = getDomainFromEmail(email.sender);
+  const findingLines  = findings.length
+    ? findings.map(f => `- [${f.severity}] ${f.message}`).join("\n")
     : "Geen deterministische signalen gevonden";
 
-  const prompt = `Je bent een expert phishing-analist. Analyseer deze e-mail KRITISCH en geef een eerlijke risicoscore.
+  return `Je bent een expert phishing-analist. Analyseer deze e-mail en geef een nauwkeurige risicoscore.
 
-E-MAIL:
-Afzender: ${email.sender}
-Onderwerp: ${email.subject}
-Body: ${(email.body || "").slice(0, 1500)}
-Links: ${(email.links || []).join(", ") || "geen"}
+AFZENDER: ${email.sender} (domein: ${senderDomain})
+ONDERWERP: ${email.subject}
+BODY: ${(email.body || "").slice(0, CONFIG.bodyMaxChars)}
+LINKS: ${(email.links || []).slice(0, CONFIG.maxLinks).join(", ") || "geen"}
 
 REEDS GEVONDEN SIGNALEN:
-${findingsSummary}
+${findingLines}
 
-SCORING RICHTLIJNEN:
-- 0-20%:  Duidelijk legitiem (bekende afzender, geen verdachte elementen)
-- 21-40%: Waarschijnlijk veilig maar kleine twijfels
-- 41-60%: Twijfelachtig, meerdere gele vlaggen
-- 61-80%: Waarschijnlijk phishing, duidelijke rode vlaggen
-- 81-100%: Bijna zeker phishing (brand spoofing + verdachte links + urgentie = minimaal 85%)
+DOMEIN BEOORDELING:
+- Wereldwijd bekend legitiem domein → domainLegit: true, score max 20%
+- Onbekend of willekeurig domein → domainLegit: false, score min 65%
+- Domein imiteert een merk → domainLegit: false, score min 85%
 
-BELANGRIJK: Als een e-mail een bekend merk nagebootst (DHL, PayPal, bank etc.) maar van een vreemd domein komt, is de score MINIMAAL 80%.
+SCOREGIDS:
+0-20:  Legitiem — bekend merk, geen rode vlaggen
+21-40: Waarschijnlijk veilig
+41-60: Twijfelachtig
+61-80: Waarschijnlijk phishing
+81-100: Vrijwel zeker phishing
 
-Geef ALLEEN JSON terug:
+Geef UITSLUITEND geldige JSON terug:
 {
-  "aiScore": <0-100>,
+  "aiScore": <integer 0-100>,
+  "domainLegit": <boolean>,
   "verdict": "<veilig|verdacht|gevaarlijk>",
-  "summary": "<2-3 zinnen uitleg in het Nederlands>",
-  "signals": [
-    { "message": "<signaal>", "severity": "<low|medium|high>" }
-  ]
+  "summary": "<2-3 zinnen in het Nederlands>",
+  "signals": [{ "message": "<string>", "severity": "<low|medium|high>" }]
 }`;
+}
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+async function analyzeWithClaude(email, findings) {
+  if (!CONFIG.anthropicApiKey) {
+    return { aiScore: 0, domainLegit: false, verdict: "onbekend", summary: "AI niet geconfigureerd", signals: [] };
+  }
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
     method:  "POST",
     headers: {
       "Content-Type":      "application/json",
-      "x-api-key":         ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
+      "x-api-key":         CONFIG.anthropicApiKey,
+      "anthropic-version": CONFIG.anthropicVersion,
     },
     body: JSON.stringify({
-      model:      "claude-haiku-4-5-20251001",
-      max_tokens: 600,
-      messages:   [{ role: "user", content: prompt }],
+      model:      CONFIG.anthropicModel,
+      max_tokens: CONFIG.maxTokens,
+      messages:   [{ role: "user", content: buildPrompt(email, findings) }],
     }),
   });
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Anthropic API fout ${response.status}: ${err}`);
-  }
+  if (!res.ok) throw new Error(`Anthropic ${res.status}: ${await res.text()}`);
 
-  const data  = await response.json();
-  const text  = (data.content || []).map(b => b.text || "").join("");
-  const clean = text.replace(/```json|```/g, "").trim();
+  const data   = await res.json();
+  const text   = (data.content || []).map(b => b.text || "").join("");
+  const parsed = safeParseJson(text);
 
-  try {
-    return JSON.parse(clean);
-  } catch {
-    return { signals: [], aiScore: 0, verdict: "onbekend", summary: "" };
-  }
+  return parsed ?? { aiScore: 0, domainLegit: false, verdict: "onbekend", summary: "", signals: [] };
 }
 
-// ── Score berekening ──────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// SCORER
+// ─────────────────────────────────────────────────────────────────────────────
+
+function getDomainAgeSignal(domainAge) {
+  if (!domainAge) return null;
+  const { ageInDays } = domainAge;
+  const { ageDays }   = CONFIG.scoring;
+  if (ageInDays < ageDays.veryNew) return { message: `Domein slechts ${ageInDays} dagen oud — zeer verdacht`, severity: "high" };
+  if (ageInDays < ageDays.young)   return { message: `Domein ${ageInDays} dagen oud (< 6 maanden)`, severity: "medium" };
+  if (ageInDays > ageDays.old)     return { message: `Domein ${Math.floor(ageInDays / 365)} jaar oud — legitimiteitssignaal`, severity: "low" };
+  return null;
+}
+
+function getAgeBoost(domainAge) {
+  if (!domainAge) return 0;
+  const { ageInDays } = domainAge;
+  const { ageDays, ageBoosts } = CONFIG.scoring;
+  if (ageInDays < ageDays.veryNew) return ageBoosts.veryNew;
+  if (ageInDays < ageDays.young)   return ageBoosts.young;
+  if (ageInDays > ageDays.old)     return ageBoosts.old;
+  return 0;
+}
+
+function getSignalFloor(highCount, mediumCount) {
+  const { floors } = CONFIG.scoring;
+  if (highCount >= 3)    return floors.threeHigh;
+  if (highCount >= 2)    return floors.twoHigh;
+  if (highCount >= 1)    return floors.oneHigh;
+  if (mediumCount >= 2)  return floors.twoMedium;
+  return 0;
+}
+
+function buildBreakdown(aiScore, findings, deterministicScore) {
+  return {
+    claude:       aiScore,
+    safeBrowsing: Math.min(findings.filter(f => f.severity === "high").length * 35, 100),
+    virusTotal:   Math.min(findings.filter(f => f.message.includes("link") || f.message.includes("TLD")).length * 40, 100),
+    domain:       deterministicScore,
+  };
+}
+
 function calculateScore(findings, aiResult, domainAge) {
   const highCount   = findings.filter(f => f.severity === "high").length;
   const mediumCount = findings.filter(f => f.severity === "medium").length;
-  const aiScore     = Math.min(aiResult.aiScore || 0, 100);
-
-  // Deterministische score op basis van gevonden signalen
-  let deterministicScore = 0;
-  deterministicScore += highCount   * 35;
-  deterministicScore += mediumCount * 15;
-  deterministicScore = Math.min(deterministicScore, 100);
-
+  const aiScore     = Math.min(Math.max(aiResult.aiScore || 0, 0), 100);
   const domainLegit = aiResult.domainLegit === true;
+  const ageBoost    = getAgeBoost(domainAge);
+  const s           = CONFIG.scoring;
 
-  // Domein leeftijd factor
-  let domainAgeScore = 0;
-  if (domainAge !== null) {
-    if (domainAge.ageInDays < 30)  domainAgeScore = 40; // Zeer nieuw = gevaarlijk
-    else if (domainAge.ageInDays < 180) domainAgeScore = 20; // Jong = verdacht
-    else if (domainAge.ageInDays > 730) domainAgeScore = -15; // Oud = legitimiteitspunt
-  }
-
-  // CATEGORIE A: Bekend legitiem domein + oud domein + geen rode signalen → max 20%
-  if (domainLegit && highCount === 0 && mediumCount <= 1 && domainAgeScore <= 0) {
+  // Fast path: clearly legitimate — cap score low
+  if (domainLegit && highCount === 0 && mediumCount <= 1 && ageBoost <= 0) {
     return {
-      total: Math.min(Math.round(aiScore * 0.3), 20),
-      breakdown: { claude: aiScore, safeBrowsing: 0, virusTotal: 0, domain: 0 }
+      total:     Math.min(Math.round(aiScore * 0.3), s.legitimateCap),
+      breakdown: buildBreakdown(aiScore, findings, 0),
     };
   }
 
-  // CATEGORIE B: Onbekend/random domein → minimaal 65%
-  const unknownDomainMinimum = !domainLegit && aiScore >= 60 ? 65 : 0;
+  const deterministicScore = Math.min(
+    highCount * s.highSignalPoints + mediumCount * s.mediumSignalPoints,
+    100
+  );
 
-  // Minimumscores op basis van rode signalen
-  let minimum = unknownDomainMinimum;
-  if (highCount >= 3) minimum = Math.max(minimum, 85);
-  else if (highCount >= 2) minimum = Math.max(minimum, 75);
-  else if (highCount >= 1) minimum = Math.max(minimum, 55);
-  else if (mediumCount >= 2) minimum = Math.max(minimum, 40);
+  const floor = Math.max(
+    getSignalFloor(highCount, mediumCount),
+    !domainLegit && aiScore >= 60 ? 65 : 0  // unknown domain floor
+  );
 
-  // Gewogen gemiddelde inclusief domeinleeftijd
-  let total = Math.round((deterministicScore * 0.4) + (aiScore * 0.4) + Math.max(domainAgeScore, 0) * 0.5);
+  const raw   = Math.round(
+    deterministicScore * s.deterministicWeight +
+    aiScore            * s.aiWeight +
+    Math.max(ageBoost, 0) * s.ageBoostWeight
+  );
+  const total = Math.min(Math.max(raw, floor), 100);
 
-  // Minimum altijd gegarandeerd
-  total = Math.max(total, minimum);
-  total = Math.min(total, 100);
-
-  return {
-    total,
-    breakdown: {
-      claude:       aiScore,
-      safeBrowsing: Math.min(highCount * 35, 100),
-      virusTotal:   Math.min(findings.filter(f => f.message.includes("domein") || f.message.includes("link")).length * 40, 100),
-      domain:       deterministicScore,
-    },
-  };
+  return { total, breakdown: buildBreakdown(aiScore, findings, deterministicScore) };
 }
 
 function getVerdict(score) {
@@ -390,9 +450,87 @@ function getVerdict(score) {
   return "veilig";
 }
 
-app.listen(PORT, () => {
-  console.log(`\n🛡️  PhishGuard backend draait op poort ${PORT}`);
-  console.log(`   CORS:    Outlook + Gmail + Browser extensie`);
-  console.log(`   Health:  http://localhost:${PORT}/health`);
-  console.log(`   API key: ${ANTHROPIC_API_KEY ? "✓ gevonden" : "✗ ONTBREEKT"}\n`);
+// ─────────────────────────────────────────────────────────────────────────────
+// REQUEST HANDLER
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function handleScan(req, res) {
+  const { sender, senderName, subject, body, links, receivedAt } = req.body;
+
+  if (!sender && !subject && !body) {
+    return res.status(400).json({ error: "Geen e-mail data ontvangen" });
+  }
+
+  // Step 1: fast synchronous checks
+  const findings = runDeterministicChecks({ sender, subject, body, links });
+
+  // Step 2: slow IO in parallel — AI + RDAP
+  const [aiResult, domainAge] = await Promise.all([
+    analyzeWithClaude({ sender, senderName, subject, body, links, receivedAt }, findings),
+    getDomainAge(sender),
+  ]);
+
+  // Step 3: enrich findings with domain age
+  const ageSignal = getDomainAgeSignal(domainAge);
+  if (ageSignal) findings.push(ageSignal);
+
+  // Step 4: score
+  const score = calculateScore(findings, aiResult, domainAge);
+
+  // ENGINEER FIX: deduplicate before sending
+  const allSignals = deduplicateSignals([...findings, ...(aiResult.signals || [])]);
+  const verdict    = getVerdict(score.total);
+
+  res.json({
+    score:     score.total,
+    verdict,
+    breakdown: score.breakdown,
+    summary:   aiResult.summary || "",
+    signals:   allSignals,
+    domainAge: domainAge
+      ? { days: domainAge.ageInDays, registeredAt: domainAge.registeredAt }
+      : null,
+  });
+}
+
+function handleHealth(req, res) {
+  res.json({
+    status:    "ok",
+    version:   "3.1.0",
+    ai:        CONFIG.anthropicApiKey ? "✓ connected" : "✗ missing key",
+    cache:     `${domainCache.size} domains cached`,
+    uptime:    `${Math.round(process.uptime())}s`,
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SERVER BOOTSTRAP
+// ─────────────────────────────────────────────────────────────────────────────
+
+const app = express();
+
+app.use(cors({
+  origin:         CONFIG.allowedOrigins,
+  methods:        ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}));
+app.use(express.json({ limit: "1mb" }));
+app.use(express.static("public"));
+
+app.get("/health", handleHealth);
+
+app.post("/scan", async (req, res) => {
+  try {
+    await handleScan(req, res);
+  } catch (err) {
+    console.error("[scan] Unhandled error:", err.message);
+    res.status(500).json({ error: err.message, score: 0, signals: [], verdict: "onbekend" });
+  }
+});
+
+app.listen(CONFIG.port, () => {
+  console.log(`\n🛡️  PhishGuard v3.1.0 — poort ${CONFIG.port}`);
+  console.log(`   AI:    ${CONFIG.anthropicApiKey ? "✓ Claude" : "✗ sleutel ontbreekt"}`);
+  console.log(`   CORS:  Outlook · Gmail · Extensie`);
+  console.log(`   Ready.\n`);
 });
