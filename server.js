@@ -229,13 +229,18 @@ function checkBrandSpoofing(senderEmail) {
     );
     if (isOfficial) continue; // legitimate sender
 
-    // Typosquat: root domain contains brand name but isn't official
-    // e.g. "dhl-tracking.com", "paypal-secure.net", "ing-alert.xyz"
-    const isTyposquat = rootDomain.includes(brand) && !isOfficial;
+    // Typosquat: brand appears as a complete word segment in the root domain
+    // e.g. "dhl-tracking.com" → segments: ["dhl","tracking"] → match
+    // e.g. "businessinsider.com" → segments: ["businessinsider"] → no match for "ns"
+    const rootWithoutTld = rootDomain.replace(/\.(com|nl|net|org|xyz|top|io|cc|pw|be|de|fr|uk|ru)$/, "");
+    const rootSegments   = rootWithoutTld.split(/[\.\-]/);
+    const isTyposquat    = rootSegments.includes(brand) && !isOfficial;
 
-    // Subdomain spoof: full domain contains brand as subdomain of unknown root
-    // e.g. "dhl.scammer.ru" — root is "scammer.ru", but "dhl" appears before it
-    const isSubdomainSpoof = domain.split(".").slice(0, -2).includes(brand);
+    // Subdomain spoof: brand appears as an exact subdomain segment before the root
+    // e.g. "dhl.scammer.ru" → subdomains: ["dhl"] → match
+    // e.g. "email.businessinsider.com" → subdomains: ["email"] → no match for "ns"
+    const subdomainSegments = domain.split(".").slice(0, -2);
+    const isSubdomainSpoof  = subdomainSegments.includes(brand);
 
     if (isTyposquat || isSubdomainSpoof) {
       return {
@@ -286,13 +291,80 @@ function checkGenericGreeting(body) {
     : null;
 }
 
-function runDeterministicChecks({ sender, subject, body, links }) {
+function checkLinkMismatches(linkMismatches = []) {
+  return linkMismatches.map(({ visible, actual }) => ({
+    message:  `Link toont "${visible}" maar verwijst naar "${actual}"`,
+    severity: "high",
+  }));
+}
+
+function checkAttachments(attachments = [], body = "") {
+  const dangerous = [".exe",".js",".vbs",".bat",".scr",".docm",".xlsm",".zip",".rar"];
+  const signals   = [];
+
+  // Flag dangerous extensions found in email
+  const found = dangerous.filter(ext =>
+    attachments.some(a => a.toLowerCase().includes(ext)) ||
+    body.toLowerCase().includes(ext)
+  );
+  if (found.length > 0) {
+    signals.push({
+      message:  `Verdachte bijlage gevonden: ${found.join(", ")}`,
+      severity: "high",
+    });
+  } else if (attachments.length > 0) {
+    signals.push({
+      message:  `E-mail bevat ${attachments.length} bijlage(n) — controleer de afzender`,
+      severity: "medium",
+    });
+  }
+  return signals;
+}
+
+function checkQrCode(hasQrCode = false) {
+  if (!hasQrCode) return null;
+  return {
+    message:  "E-mail bevat mogelijk een QR-code zonder tekstlinks — klassieke QR-phishing tactiek",
+    severity: "high",
+  };
+}
+
+function checkColleagueImpersonation(sender = "", subject = "", body = "", companyDomain = "") {
+  if (!companyDomain) return null;
+
+  const senderDomain = (sender.split("@")[1] || "").toLowerCase();
+  const companyLower = companyDomain.toLowerCase();
+
+  // Sender claims to be from company but domain doesn't match
+  const bodyLower    = body.toLowerCase().slice(0, 500);
+  const subjectLower = subject.toLowerCase();
+
+  const mentionsCompany = bodyLower.includes(companyLower.split(".")[0]) ||
+                          subjectLower.includes(companyLower.split(".")[0]);
+
+  const isNotCompanyDomain = senderDomain !== companyLower &&
+                             !senderDomain.endsWith("." + companyLower);
+
+  if (mentionsCompany && isNotCompanyDomain && senderDomain) {
+    return {
+      message:  `Afzender (${senderDomain}) beweert van ${companyDomain} te zijn maar gebruikt een ander domein`,
+      severity: "high",
+    };
+  }
+  return null;
+}
+
+function runDeterministicChecks({ sender, subject, body, links, linkMismatches, attachments, hasQrCode, companyDomain }) {
   return [
     checkBrandSpoofing(sender),
     checkUrgency(subject, body),
     ...checkLinks(links),
+    ...checkLinkMismatches(linkMismatches),
+    ...checkAttachments(attachments, body),
+    checkQrCode(hasQrCode),
     checkCredentials(body),
     checkGenericGreeting(body),
+    checkColleagueImpersonation(sender, subject, body, companyDomain),
   ].filter(Boolean);
 }
 
@@ -455,14 +527,15 @@ function getVerdict(score) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function handleScan(req, res) {
-  const { sender, senderName, subject, body, links, receivedAt } = req.body;
+  const { sender, senderName, subject, body, links, receivedAt,
+          linkMismatches, attachments, hasQrCode, companyDomain } = req.body;
 
   if (!sender && !subject && !body) {
     return res.status(400).json({ error: "Geen e-mail data ontvangen" });
   }
 
   // Step 1: fast synchronous checks
-  const findings = runDeterministicChecks({ sender, subject, body, links });
+  const findings = runDeterministicChecks({ sender, subject, body, links, linkMismatches, attachments, hasQrCode, companyDomain });
 
   // Step 2: slow IO in parallel — AI + RDAP
   const [aiResult, domainAge] = await Promise.all([
