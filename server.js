@@ -22,6 +22,68 @@ app.use(express.static("public"));
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
+// ── Domein cache — voorkomt dubbele RDAP calls ────────────────────────
+const domainCache = new Map();
+const CACHE_TTL   = 24 * 60 * 60 * 1000; // 24 uur
+
+async function checkDomainAge(domain) {
+  if (!domain) return null;
+
+  // Haal rootdomein op (bijv. mail.evil.xyz → evil.xyz)
+  const parts      = domain.split(".");
+  const rootDomain = parts.length > 2 ? parts.slice(-2).join(".") : domain;
+
+  // Check cache eerst
+  const cached = domainCache.get(rootDomain);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    return cached.result;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout    = setTimeout(() => controller.abort(), 3000); // 3s timeout
+
+    const response = await fetch(`https://rdap.org/domain/${rootDomain}`, {
+      signal: controller.signal,
+      headers: { "Accept": "application/json" }
+    });
+
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      domainCache.set(rootDomain, { result: null, timestamp: Date.now() });
+      return null;
+    }
+
+    const data   = await response.json();
+    const events = data.events || [];
+
+    // Zoek registratiedatum
+    const regEvent = events.find(e =>
+      e.eventAction === "registration" || e.eventAction === "created"
+    );
+
+    if (!regEvent || !regEvent.eventDate) {
+      domainCache.set(rootDomain, { result: null, timestamp: Date.now() });
+      return null;
+    }
+
+    const regDate  = new Date(regEvent.eventDate);
+    const ageInDays = Math.floor((Date.now() - regDate.getTime()) / (1000 * 60 * 60 * 24));
+
+    const result = { ageInDays, registeredAt: regEvent.eventDate, domain: rootDomain };
+    domainCache.set(rootDomain, { result, timestamp: Date.now() });
+
+    console.log(`[RDAP] ${rootDomain}: ${ageInDays} dagen oud`);
+    return result;
+
+  } catch (e) {
+    if (e.name !== "AbortError") console.error(`[RDAP] Fout voor ${rootDomain}:`, e.message);
+    domainCache.set(rootDomain, { result: null, timestamp: Date.now() });
+    return null;
+  }
+}
+
 app.get("/health", (req, res) => {
   res.json({
     status:  "ok",
@@ -41,14 +103,37 @@ app.post("/scan", async (req, res) => {
     // Deterministische checks
     const findings = runDeterministicChecks({ sender, subject, body, links });
 
-    // AI analyse
-    const aiResult = await analyzeWithClaude(
-      { sender, senderName, subject, body, links, receivedAt },
-      findings
-    );
+    // Haal afzenderdomein op
+    const senderDomain = (sender || "").split("@")[1] || "";
+
+    // Claude AI + RDAP domeincheck parallel uitvoeren (sneller!)
+    const [aiResult, domainAge] = await Promise.all([
+      analyzeWithClaude({ sender, senderName, subject, body, links, receivedAt }, findings),
+      checkDomainAge(senderDomain)
+    ]);
+
+    // Voeg domeinleeftijd toe aan signalen
+    if (domainAge !== null) {
+      if (domainAge.ageInDays < 30) {
+        findings.push({
+          message:  `Domein is slechts ${domainAge.ageInDays} dagen oud — extreem verdacht`,
+          severity: "high"
+        });
+      } else if (domainAge.ageInDays < 180) {
+        findings.push({
+          message:  `Domein is ${domainAge.ageInDays} dagen oud (minder dan 6 maanden)`,
+          severity: "medium"
+        });
+      } else if (domainAge.ageInDays > 730) {
+        findings.push({
+          message:  `Domein bestaat al ${Math.floor(domainAge.ageInDays / 365)} jaar — legitimiteitssignaal`,
+          severity: "low"
+        });
+      }
+    }
 
     // Score berekenen
-    const score = calculateScore(findings, aiResult);
+    const score = calculateScore(findings, aiResult, domainAge);
 
     res.json({
       score:     score.total,
@@ -56,6 +141,10 @@ app.post("/scan", async (req, res) => {
       signals:   [...findings, ...(aiResult.signals || [])],
       verdict:   aiResult.verdict || getVerdict(score.total),
       summary:   aiResult.summary || "",
+      domainAge: domainAge ? {
+        days: domainAge.ageInDays,
+        registeredAt: domainAge.registeredAt
+      } : null
     });
 
   } catch (err) {
@@ -85,36 +174,20 @@ function runDeterministicChecks({ sender, subject, body, links }) {
     "belastingdienst": ["belastingdienst.nl"], "klm": ["klm.com"],
   };
 
-  // Legitieme email/betaal diensten die namens anderen sturen
-  const trustedSenders = [
-    "stripe.com", "sendgrid.net", "mailchimp.com", "mailgun.org",
-    "amazonses.com", "sparkpostmail.com", "mandrillapp.com",
-    "exacttarget.com", "salesforce.com", "hubspot.com",
-    "klaviyo.com", "brevo.com", "sendinblue.com", "postmarkapp.com",
-    "news.bitvavo.com", "em.bitvavo.com"
-  ];
-
   const senderDomain = senderLower.split("@")[1] || "";
-  const isTrustedSender = trustedSenders.some(d => senderDomain === d || senderDomain.endsWith(`.${d}`));
 
-  if (!isTrustedSender) {
-    for (const brand of brands) {
-      const inSubject = subjectLower.includes(brand);
-      const inBody    = bodyLower.slice(0, 500).includes(brand); // Alleen eerste 500 chars
-      const inSender  = senderLower.includes(brand);
-      const legitDomains = brandDomains[brand] || [`${brand}.com`, `${brand}.nl`];
-      const isLegitDomain = legitDomains.some(d => senderDomain === d || senderDomain.endsWith(`.${d}`));
+  // Alleen flaggen als brand IN het afzenderdomein zit maar niet het echte domein is
+  for (const brand of brands) {
+    const legitDomains = brandDomains[brand] || [`${brand}.com`, `${brand}.nl`];
+    const isLegitDomain = legitDomains.some(d => senderDomain === d || senderDomain.endsWith(`.${d}`));
+    const brandInDomain = senderDomain.includes(brand) && !isLegitDomain;
 
-      // Alleen flaggen als brand IN het afzenderdomein zit maar niet het echte domein is
-      const brandInDomain = senderDomain.includes(brand) && !isLegitDomain;
-
-      if (brandInDomain && senderDomain) {
-        signals.push({
-          message:  `Afzender (${senderDomain}) doet zich voor als ${brand.toUpperCase()} — klassieke spoofing`,
-          severity: "high"
-        });
-        break;
-      }
+    if (brandInDomain && senderDomain) {
+      signals.push({
+        message:  `Afzender (${senderDomain}) doet zich voor als ${brand.toUpperCase()} — klassieke spoofing`,
+        severity: "high"
+      });
+      break;
     }
   }
 
@@ -242,7 +315,7 @@ Geef ALLEEN JSON terug:
 }
 
 // ── Score berekening ──────────────────────────────────────────────────
-function calculateScore(findings, aiResult) {
+function calculateScore(findings, aiResult, domainAge) {
   const highCount   = findings.filter(f => f.severity === "high").length;
   const mediumCount = findings.filter(f => f.severity === "medium").length;
   const aiScore     = Math.min(aiResult.aiScore || 0, 100);
@@ -253,17 +326,38 @@ function calculateScore(findings, aiResult) {
   deterministicScore += mediumCount * 15;
   deterministicScore = Math.min(deterministicScore, 100);
 
-  // Minimumscores op basis van rode signalen — AI mag dit NIET omlaag trekken
-  let minimum = 0;
-  if (highCount >= 3) minimum = 80;
-  else if (highCount >= 2) minimum = 70;
-  else if (highCount >= 1) minimum = 50;
-  else if (mediumCount >= 2) minimum = 35;
+  const domainLegit = aiResult.domainLegit === true;
 
-  // Gewogen gemiddelde — deterministisch weegt zwaarder
-  let total = Math.round((deterministicScore * 0.5) + (aiScore * 0.5));
+  // Domein leeftijd factor
+  let domainAgeScore = 0;
+  if (domainAge !== null) {
+    if (domainAge.ageInDays < 30)  domainAgeScore = 40; // Zeer nieuw = gevaarlijk
+    else if (domainAge.ageInDays < 180) domainAgeScore = 20; // Jong = verdacht
+    else if (domainAge.ageInDays > 730) domainAgeScore = -15; // Oud = legitimiteitspunt
+  }
 
-  // Minimum altijd gegarandeerd — rode signalen winnen van AI
+  // CATEGORIE A: Bekend legitiem domein + oud domein + geen rode signalen → max 20%
+  if (domainLegit && highCount === 0 && mediumCount <= 1 && domainAgeScore <= 0) {
+    return {
+      total: Math.min(Math.round(aiScore * 0.3), 20),
+      breakdown: { claude: aiScore, safeBrowsing: 0, virusTotal: 0, domain: 0 }
+    };
+  }
+
+  // CATEGORIE B: Onbekend/random domein → minimaal 65%
+  const unknownDomainMinimum = !domainLegit && aiScore >= 60 ? 65 : 0;
+
+  // Minimumscores op basis van rode signalen
+  let minimum = unknownDomainMinimum;
+  if (highCount >= 3) minimum = Math.max(minimum, 85);
+  else if (highCount >= 2) minimum = Math.max(minimum, 75);
+  else if (highCount >= 1) minimum = Math.max(minimum, 55);
+  else if (mediumCount >= 2) minimum = Math.max(minimum, 40);
+
+  // Gewogen gemiddelde inclusief domeinleeftijd
+  let total = Math.round((deterministicScore * 0.4) + (aiScore * 0.4) + Math.max(domainAgeScore, 0) * 0.5);
+
+  // Minimum altijd gegarandeerd
   total = Math.max(total, minimum);
   total = Math.min(total, 100);
 
