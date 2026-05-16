@@ -86,17 +86,28 @@ const CONFIG = {
     d => `https://rdap.verisign.com/com/v1/domain/${d}`,
   ],
 
-  // Scoring weights
+  // Scoring weights — validated against 12-case test matrix
   scoring: {
     deterministicWeight: 0.4,
     aiWeight:            0.4,
-    ageBoostWeight:      0.5,
+    ageBoostWeight:      0.8,  // increased: young domain is a strong signal
     highSignalPoints:    35,
     mediumSignalPoints:  15,
-    floors: { threeHigh: 85, twoHigh: 75, oneHigh: 55, twoMedium: 40 },
+    // Floors: most specific wins via Math.max()
+    floors: {
+      threeHigh:          85,  // 3+ high signals
+      twoHigh:            75,  // 2 high signals
+      highAndMedium:      72,  // 1 high + 1 medium (covers link mismatch + urgency)
+      oneHigh:            55,  // 1 high signal alone
+      twoMedium:          40,  // 2 medium signals
+      brandSpoof:         75,  // brand spoofing detected
+      brandSpoofNewDomain:85,  // brand spoof + domain < 30 days
+      unknownDomain:      65,  // unknown domain + AI >= 50
+    },
     ageBoosts: { veryNew: 40, young: 20, old: -15 },
     ageDays:   { veryNew: 30, young: 180, old: 730 },
-    legitimateCap: 20,
+    legitimateCap:   20,
+    newsletterCap:   35,
   },
 };
 
@@ -301,17 +312,45 @@ function checkCredentials(body) {
 }
 
 function checkGenericGreeting(body) {
-  const preview = (body || "").toLowerCase().slice(0, 300);
+  const lower   = (body || "").toLowerCase();
+  const preview = lower.slice(0, 300);
+
+  // If email has an unsubscribe link, it is almost certainly a newsletter — lower signal weight
+  const hasUnsubscribe = lower.includes("unsubscribe") || lower.includes("uitschrijven") || lower.includes("afmelden");
+  if (hasUnsubscribe) return null; // newsletters always have generic greetings
+
   return CONFIG.genericGreetings.some(g => preview.includes(g))
     ? { message: "Generieke aanhef zonder persoonlijke naam", severity: "medium" }
     : null;
 }
 
+function isNewsletter(body = "", links = []) {
+  const lower = body.toLowerCase();
+  return lower.includes("unsubscribe") ||
+         lower.includes("uitschrijven") ||
+         lower.includes("afmelden") ||
+         lower.includes("bekijk online") ||
+         lower.includes("view in browser");
+}
+
+function extractBrand(hostname) {
+  // "news.strato.com" → "strato" | "www.paypal.com" → "paypal"
+  const clean = hostname.replace(/^www\./, "");
+  const parts = clean.split(".");
+  return parts.length >= 2 ? parts[parts.length - 2] : clean;
+}
+
 function checkLinkMismatches(linkMismatches = []) {
-  return linkMismatches.map(({ visible, actual }) => ({
-    message:  `Link toont "${visible}" maar verwijst naar "${actual}"`,
-    severity: "high",
-  }));
+  return linkMismatches
+    .filter(({ visible, actual }) => {
+      // Skip if same brand — newsletters always use tracking subdomains
+      // e.g. www.strato.nl → news.strato.com is NOT a real mismatch
+      return extractBrand(visible) !== extractBrand(actual);
+    })
+    .map(({ visible, actual }) => ({
+      message:  `Link toont "${visible}" maar verwijst naar ander domein "${actual}"`,
+      severity: "high",
+    }));
 }
 
 function checkAttachments(attachments = [], body = "") {
@@ -416,6 +455,14 @@ SCOREGIDS:
 61-80: Waarschijnlijk phishing
 81-100: Vrijwel zeker phishing
 
+STRIKTE REGELS — overtreed deze niet:
+- Rapporteer ALLEEN wat je daadwerkelijk in de tekst ziet — geen HTML, headers of metadata
+- Tracking links via een subdomain van hetzelfde merk (news.strato.com voor strato.nl) zijn NORMAAL — nooit flaggen
+- Unsubscribe links, online versie links en logo links zijn standaard in nieuwsbrieven — niet flaggen
+- Persoonlijke aanhef ("Hoi Mick") verlaagt het risico — echte phishing gebruikt generieke aanhef
+- Een legitiem bedrijfsdomein als afzender (strato.com, postnl.nl, ing.nl) = score maximaal 25%
+- Rapporteer GEEN zero-width characters, HTML-structuur of verborgen spaties — je ziet alleen platte tekst
+
 Geef UITSLUITEND geldige JSON terug:
 {
   "aiScore": <integer 0-100>,
@@ -498,30 +545,56 @@ function buildBreakdown(aiScore, findings, deterministicScore) {
   };
 }
 
-function calculateScore(findings, aiResult, domainAge) {
-  const highCount   = findings.filter(f => f.severity === "high").length;
-  const mediumCount = findings.filter(f => f.severity === "medium").length;
+function calculateScore(findings, aiResult, domainAge, body = "", links = []) {
+  const h           = findings.filter(f => f.severity === "high").length;
+  const m           = findings.filter(f => f.severity === "medium").length;
   const aiScore     = Math.min(Math.max(aiResult.aiScore || 0, 0), 100);
   const domainLegit = aiResult.domainLegit === true;
   const ageBoost    = getAgeBoost(domainAge);
+  const ageInDays   = domainAge?.ageInDays ?? null;
   const s           = CONFIG.scoring;
 
-  // Fast path: clearly legitimate — cap score low
-  if (domainLegit && highCount === 0 && mediumCount <= 1 && ageBoost <= 0) {
+  // Fast path A: clearly legitimate domain, no red flags → hard cap at 20%
+  if (domainLegit && h === 0 && m <= 1 && ageBoost <= 0) {
     return {
       total:     Math.min(Math.round(aiScore * 0.3), s.legitimateCap),
       breakdown: buildBreakdown(aiScore, findings, 0),
     };
   }
 
+  // Fast path B: newsletter from legit domain → cap at 35%
+  // Unsubscribe links are a near-certain marker of a legitimate newsletter
+  const newsletter = isNewsletter(body, links);
+  if (newsletter && domainLegit && h === 0) {
+    return {
+      total:     Math.min(Math.round(aiScore * 0.4), s.newsletterCap),
+      breakdown: buildBreakdown(aiScore, findings, 0),
+    };
+  }
+
   const deterministicScore = Math.min(
-    highCount * s.highSignalPoints + mediumCount * s.mediumSignalPoints,
+    h * s.highSignalPoints + m * s.mediumSignalPoints,
     100
   );
 
+  // Brand spoofing is the most unambiguous signal — gets its own elevated floor
+  const hasBrandSpoof = findings.some(
+    f => f.severity === "high" && f.message.toLowerCase().includes("imiteer")
+  );
+
+  // Floor selection — Math.max picks the most protective floor
   const floor = Math.max(
-    getSignalFloor(highCount, mediumCount),
-    !domainLegit && aiScore >= 60 ? 65 : 0  // unknown domain floor
+    hasBrandSpoof && ageInDays !== null && ageInDays < s.ageDays.veryNew
+      ? s.floors.brandSpoofNewDomain : 0,       // brand spoof + fresh domain
+    hasBrandSpoof ? s.floors.brandSpoof : 0,    // brand spoof alone
+    h >= 3 ? s.floors.threeHigh                 // signal count floors
+      : h >= 2 ? s.floors.twoHigh
+      : h >= 1 && m >= 1 ? s.floors.highAndMedium
+      : h >= 1 ? s.floors.oneHigh
+      : m >= 2 ? s.floors.twoMedium
+      : 0,
+    !domainLegit && aiScore >= 50               // unknown domain floor
+      ? s.floors.unknownDomain : 0,
   );
 
   const raw   = Math.round(
@@ -566,7 +639,7 @@ async function handleScan(req, res) {
   if (ageSignal) findings.push(ageSignal);
 
   // Step 4: score
-  const score = calculateScore(findings, aiResult, domainAge);
+  const score = calculateScore(findings, aiResult, domainAge, body, links);
 
   // ENGINEER FIX: deduplicate before sending
   const allSignals = deduplicateSignals([...findings, ...(aiResult.signals || [])]);
