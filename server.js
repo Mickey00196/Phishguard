@@ -52,10 +52,17 @@ const CONFIG = {
 
   // ENGINEER FIX: skip RDAP for these — also skip spoofing check
   trustedEmailProviders: new Set([
+    // Email delivery platforms
     "sendgrid.net","mailchimp.com","klaviyo.com","brevo.com",
     "hubspot.com","mailgun.org","amazonses.com","sparkpostmail.com",
     "mandrillapp.com","exacttarget.com","salesforce.com","postmarkapp.com",
     "stripe.com","constantcontact.com","campaignmonitor.com",
+    // ATS / recruitment platforms — use tracking subdomains legitimately
+    "icims.com","greenhouse.io","lever.co","workday.com","taleo.net",
+    "successfactors.com","bamboohr.com","recruitee.com","teamtailor.com",
+    // Marketing automation tracking
+    "marketo.com","pardot.com","eloqua.com","act-on.com",
+    "nurture.icims.com","tracking.icims.com",
   ]),
 
   suspiciousTlds:   new Set([".xyz",".top",".click",".tk",".ml",".ga",".cf",".pw",".cc"]),
@@ -463,9 +470,21 @@ REEDS GEVONDEN SIGNALEN:
 ${findingLines}
 
 DOMEIN BEOORDELING:
-- Wereldwijd bekend legitiem domein → domainLegit: true, score max 20%
-- Onbekend of willekeurig domein → domainLegit: false, score min 65%
-- Domein imiteert een merk → domainLegit: false, score min 85%
+- Wereldwijd bekend legitiem domein → domainLegit: true, aiScore MAX 30
+- Onbekend of willekeurig domein → domainLegit: false, aiScore min 65
+- Domein imiteert een merk → domainLegit: false, aiScore min 85
+
+TRACKING LINKS zijn NORMAAL voor legitieme nieuwsbrieven en recruitment-mails.
+Voorbeelden van legitieme tracking: tracking.icims.com, click.hubspot.com,
+links.mailchimp.com, go.salesforce.com — NOOIT als phishing markeren.
+
+COUNTER-SIGNALEN die score VERLAGEN:
+- Domein > 2 jaar oud → legitimiteitssignaal
+- Persoonlijke aanhef → minder verdacht
+- Professionele inhoud zonder urgentie → minder verdacht
+- Bekende afzender (LinkedIn, MSCI, PostNL) → score max 25%
+
+Als de meeste signalen GROEN zijn en het domein LEGITIEM is: aiScore MAX 25.
 
 SCOREGIDS:
 0-20:  Legitiem — bekend merk, geen rode vlaggen
@@ -567,22 +586,31 @@ function buildBreakdown(aiScore, findings, deterministicScore) {
 function calculateScore(findings, aiResult, domainAge, body = "", links = []) {
   const h           = findings.filter(f => f.severity === "high").length;
   const m           = findings.filter(f => f.severity === "medium").length;
+  const l           = findings.filter(f => f.severity === "low").length;
   const aiScore     = Math.min(Math.max(aiResult.aiScore || 0, 0), 100);
   const domainLegit = aiResult.domainLegit === true;
   const ageBoost    = getAgeBoost(domainAge);
   const ageInDays   = domainAge?.ageInDays ?? null;
   const s           = CONFIG.scoring;
 
-  // Fast path A: clearly legitimate domain, no red flags → hard cap at 20%
-  if (domainLegit && h === 0 && m <= 1 && ageBoost <= 0) {
+  // ── PATH A: Verified legitimate domain ────────────────────────────────────
+  // When AI confirms domain is legit AND domain is old, cap score hard at 35%.
+  // Counter-signals (low severity = legitimacy markers) further reduce score.
+  // This handles newsletters, recruitment emails, transactional emails that
+  // have tracking links or generic greetings — normal for legitimate senders.
+  if (domainLegit && ageBoost <= 0) {
+    const legitimacyReduction = l * 8; // each green signal reduces score
+    const raw = Math.max(
+      Math.round(h * 20 + m * 10 - legitimacyReduction + aiScore * 0.2),
+      0
+    );
     return {
-      total:     Math.min(Math.round(aiScore * 0.3), s.legitimateCap),
-      breakdown: buildBreakdown(aiScore, findings, 0),
+      total:     Math.min(raw, 35),
+      breakdown: buildBreakdown(aiScore, findings, Math.min(h * 20 + m * 10, 100)),
     };
   }
 
-  // Fast path B: newsletter from legit domain → cap at 35%
-  // Unsubscribe links are a near-certain marker of a legitimate newsletter
+  // ── PATH B: Newsletter from legit domain (young domain edge case) ──────────
   const newsletter = isNewsletter(body, links);
   if (newsletter && domainLegit && h === 0) {
     return {
@@ -591,29 +619,27 @@ function calculateScore(findings, aiResult, domainAge, body = "", links = []) {
     };
   }
 
+  // ── PATH C: Unknown / suspicious domain ───────────────────────────────────
   const deterministicScore = Math.min(
     h * s.highSignalPoints + m * s.mediumSignalPoints,
     100
   );
 
-  // Brand spoofing is the most unambiguous signal — gets its own elevated floor
   const hasBrandSpoof = findings.some(
     f => f.severity === "high" && f.message.toLowerCase().includes("imiteer")
   );
 
-  // Floor selection — Math.max picks the most protective floor
   const floor = Math.max(
     hasBrandSpoof && ageInDays !== null && ageInDays < s.ageDays.veryNew
-      ? s.floors.brandSpoofNewDomain : 0,       // brand spoof + fresh domain
-    hasBrandSpoof ? s.floors.brandSpoof : 0,    // brand spoof alone
-    h >= 3 ? s.floors.threeHigh                 // signal count floors
+      ? s.floors.brandSpoofNewDomain : 0,
+    hasBrandSpoof ? s.floors.brandSpoof : 0,
+    h >= 3 ? s.floors.threeHigh
       : h >= 2 ? s.floors.twoHigh
       : h >= 1 && m >= 1 ? s.floors.highAndMedium
       : h >= 1 ? s.floors.oneHigh
       : m >= 2 ? s.floors.twoMedium
       : 0,
-    !domainLegit && aiScore >= 50               // unknown domain floor
-      ? s.floors.unknownDomain : 0,
+    !domainLegit && aiScore >= 50 ? s.floors.unknownDomain : 0,
   );
 
   const raw   = Math.round(
