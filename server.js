@@ -123,8 +123,27 @@ const getDomainFromEmail = email =>
 function getRootDomain(domain) {
   const parts = domain.split(".");
   if (parts.length <= 1) return domain;
+
+  // Multi-part TLDs: co.uk, com.au etc → take 3 parts
   if (CONFIG.multiPartTlds.some(tld => domain.endsWith(tld))) return parts.slice(-3).join(".");
-  return parts.slice(-2).join(".");
+
+  // Known hosting/reseller platforms where subdomains are user-controlled
+  // e.g. fqkwmdwm.cloxy.it.com → root should be cloxy.it.com, not it.com
+  // Without this: RDAP returns age of it.com (33 years) instead of the actual subdomain
+  const rootTwo   = parts.slice(-2).join(".");
+  const rootThree = parts.length >= 3 ? parts.slice(-3).join(".") : rootTwo;
+
+  const PLATFORM_DOMAINS = new Set([
+    "it.com","is-a.dev","netlify.app","vercel.app","pages.dev",
+    "github.io","glitch.me","repl.co","ngrok.io","railway.app",
+    "herokuapp.com","fly.dev","render.com","workers.dev",
+    "servebeer.com","ddns.net","no-ip.com","duckdns.org",
+    "000webhostapp.com","weebly.com","wixsite.com","squarespace.com",
+  ]);
+
+  if (PLATFORM_DOMAINS.has(rootTwo) && parts.length >= 3) return rootThree;
+
+  return rootTwo;
 }
 
 /** Fetch with hard timeout — returns null on failure */
