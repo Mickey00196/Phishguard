@@ -29,9 +29,25 @@ const CACHE_TTL   = 24 * 60 * 60 * 1000; // 24 uur
 async function checkDomainAge(domain) {
   if (!domain) return null;
 
-  // Haal rootdomein op (bijv. mail.evil.xyz → evil.xyz)
-  const parts      = domain.split(".");
-  const rootDomain = parts.length > 2 ? parts.slice(-2).join(".") : domain;
+  // Haal rootdomein op correct (mail.evil.xyz → evil.xyz, maar niet com/nl/org alleen)
+  const parts = domain.split(".");
+  // Bekende multi-part TLDs zoals co.uk, com.au etc.
+  const multiTlds = ["co.uk","co.nz","co.za","com.au","org.uk","net.uk","com.br"];
+  let rootDomain;
+  if (parts.length <= 1) {
+    rootDomain = domain;
+  } else if (multiTlds.some(t => domain.endsWith(t))) {
+    rootDomain = parts.slice(-3).join(".");
+  } else {
+    rootDomain = parts.slice(-2).join(".");
+  }
+
+  // Voorkom dat we generieke TLDs checken
+  const genericTlds = ["com","nl","net","org","io","co","de","fr","be","eu"];
+  if (genericTlds.includes(rootDomain)) {
+    domainCache.set(rootDomain, { result: null, timestamp: Date.now() });
+    return null;
+  }
 
   // Check cache eerst
   const cached = domainCache.get(rootDomain);
@@ -70,18 +86,33 @@ async function checkDomainAge(domain) {
     const data   = await response.json();
     const events = data.events || [];
 
-    // Zoek registratiedatum
-    const regEvent = events.find(e =>
+    // Zoek registratiedatum — pak de vroegste datum als er meerdere zijn
+    const regEvents = events.filter(e =>
+      e.eventAction === "registration" ||
+      e.eventAction === "created" ||
+      e.eventAction === "last changed"
+    );
+
+    // Sorteer en pak oudste "registration" of "created" event
+    const registrationEvent = events.find(e =>
       e.eventAction === "registration" || e.eventAction === "created"
     );
 
-    if (!regEvent || !regEvent.eventDate) {
+    if (!registrationEvent || !registrationEvent.eventDate) {
       domainCache.set(rootDomain, { result: null, timestamp: Date.now() });
       return null;
     }
 
-    const regDate  = new Date(regEvent.eventDate);
-    const ageInDays = Math.floor((Date.now() - regDate.getTime()) / (1000 * 60 * 60 * 24));
+    const regDate   = new Date(registrationEvent.eventDate);
+    const now       = new Date();
+
+    // Sanity check: datum mag niet in de toekomst zijn of voor 1990
+    if (regDate > now || regDate.getFullYear() < 1990) {
+      domainCache.set(rootDomain, { result: null, timestamp: Date.now() });
+      return null;
+    }
+
+    const ageInDays = Math.floor((now - regDate) / (1000 * 60 * 60 * 24));
 
     const result = { ageInDays, registeredAt: regEvent.eventDate, domain: rootDomain };
     domainCache.set(rootDomain, { result, timestamp: Date.now() });
